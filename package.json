@@ -1,0 +1,15 @@
+{
+  "name": "elm-actor-kafka",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build:elm": "elm make src/Main.elm --output=build/elm.js",
+    "build:ts": "node esbuild.config.mjs",
+    "build": "npm run build:elm && npm run build:ts",
+    "start": "node build/index.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}
