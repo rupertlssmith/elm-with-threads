@@ -28,7 +28,7 @@ Send operations use elm-procedure for async composition.
 Subscribe returns a real Elm Sub via port-bounce.
 
 Selectors have two type parameters: `msg` is the input message type,
-`result` is the output type after transformation.
+`a` is the output type after transformation.
 
 Subjects carry a codec for encoding/decoding between the payload type `a`
 and the system message type `msg`.
@@ -55,10 +55,10 @@ type Subject msg a
 
 
 {-| A selector for advanced P2P with metadata.
-`msg` is the input message type, `result` is the output type.
+`msg` is the input message type, `a` is the output type.
 -}
-type Selector msg result
-    = Selector (msg -> SubjectId -> Maybe result)
+type Selector msg a
+    = Selector (msg -> SubjectId -> Maybe a)
 
 
 type alias Key =
@@ -173,7 +173,7 @@ selector =
 Decodes the payload from the subject, applies the transform, and feeds
 the result through the inner selector.
 -}
-selectMap : Subject msg a -> (a -> msg) -> Selector msg result -> Selector msg result
+selectMap : Subject msg a -> (a -> msg) -> Selector msg b -> Selector msg b
 selectMap (Subject sid _ decode) transform (Selector sel) =
     Selector
         (\incomingMsg sourceSubject ->
@@ -192,22 +192,22 @@ selectMap (Subject sid _ decode) transform (Selector sel) =
 
 {-| Transform selector results.
 -}
-map : (result -> result2) -> Selector msg result -> Selector msg result2
+map : (a -> b) -> Selector msg a -> Selector msg b
 map f (Selector sel) =
     Selector (\msg sid -> Maybe.map f (sel msg sid))
 
 
 {-| Filter selector results.
 -}
-filter : (result -> Bool) -> Selector msg result -> Selector msg result
+filter : (a -> Bool) -> Selector msg a -> Selector msg a
 filter pred (Selector sel) =
     Selector
         (\msg sid ->
             sel msg sid
                 |> Maybe.andThen
-                    (\result ->
-                        if pred result then
-                            Just result
+                    (\val ->
+                        if pred val then
+                            Just val
 
                         else
                             Nothing
@@ -217,13 +217,13 @@ filter pred (Selector sel) =
 
 {-| Combine two selectors.
 -}
-orElse : Selector msg result -> Selector msg result -> Selector msg result
+orElse : Selector msg a -> Selector msg a -> Selector msg a
 orElse (Selector left) (Selector right) =
     Selector
         (\msg sid ->
             case left msg sid of
-                Just result ->
-                    Just result
+                Just val ->
+                    Just val
 
                 Nothing ->
                     right msg sid
@@ -233,28 +233,28 @@ orElse (Selector left) (Selector right) =
 {-| Add a timeout with a default value to a selector.
 In this simulation, timeouts are not enforced — the default is ignored.
 -}
-withTimeout : Float -> result -> Selector msg result -> Selector msg result
+withTimeout : Float -> a -> Selector msg a -> Selector msg a
 withTimeout _ _ sel =
     sel
 
 
 {-| One-shot select from message store.
 -}
-select : SystemContext msg parentMsg -> Selector msg result -> Procedure.Procedure Never (Maybe result) parentMsg
+select : SystemContext msg parentMsg -> Selector msg a -> Procedure.Procedure Never (Maybe a) parentMsg
 select ctx (Selector sel) =
     Procedure.fetch
         (\tagger ->
             let
                 op system =
                     let
-                        result =
+                        matched =
                             system
                                 |> Runtime.messageStoreValues
                                 |> List.filterMap
                                     (\entry -> sel entry.message entry.subjectId)
                                 |> List.head
                     in
-                    ( system, msgToCmd (tagger result) )
+                    ( system, msgToCmd (tagger matched) )
             in
             msgToCmd (ctx.runOp op)
         )
@@ -264,7 +264,7 @@ select ctx (Selector sel) =
 The selector operates on `( Meta, msg )` tuples.
 In this simulation, default metadata is provided.
 -}
-selectWithMeta : SystemContext msg parentMsg -> Selector ( Meta, msg ) result -> Procedure.Procedure Never (Maybe result) parentMsg
+selectWithMeta : SystemContext msg parentMsg -> Selector ( Meta, msg ) a -> Procedure.Procedure Never (Maybe a) parentMsg
 selectWithMeta ctx (Selector sel) =
     Procedure.fetch
         (\tagger ->
@@ -277,14 +277,14 @@ selectWithMeta ctx (Selector sel) =
                             , sequence = Nothing
                             }
 
-                        result =
+                        matched =
                             system
                                 |> Runtime.messageStoreValues
                                 |> List.filterMap
                                     (\entry -> sel ( defaultMeta, entry.message ) entry.subjectId)
                                 |> List.head
                     in
-                    ( system, msgToCmd (tagger result) )
+                    ( system, msgToCmd (tagger matched) )
             in
             msgToCmd (ctx.runOp op)
         )
@@ -293,7 +293,7 @@ selectWithMeta ctx (Selector sel) =
 {-| Subscribe to messages matching a selector. Returns a real Elm Sub
 via port-bounce.
 -}
-subscribe : ActorSystem msg -> Selector msg result -> Sub (Maybe result)
+subscribe : ActorSystem msg -> Selector msg a -> Sub (Maybe a)
 subscribe system (Selector sel) =
     Actor.Ports.onP2PSend
         (\{ messageId } ->
@@ -309,7 +309,7 @@ subscribe system (Selector sel) =
 {-| Subscribe using a meta-aware selector. Returns a real Elm Sub via port-bounce.
 In this simulation, default metadata is provided.
 -}
-subscribeWithMeta : ActorSystem msg -> Selector ( Meta, msg ) result -> Sub (Maybe result)
+subscribeWithMeta : ActorSystem msg -> Selector ( Meta, msg ) a -> Sub (Maybe a)
 subscribeWithMeta system (Selector sel) =
     let
         defaultMeta =
