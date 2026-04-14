@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 mkdir -p build
 
 echo "Building Elm..."
-elm make Main.elm --output=build/elm.js
+elm make src/Main.elm --output=build/elm.js
 
 echo "Bundling JS..."
 node esbuild.config.mjs

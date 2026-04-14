@@ -10,14 +10,18 @@ Subscribe uses real Elm Sub via port-bounce: each send fires a port notification
 JS echoes it back, and the subscribe Sub picks up matching messages.
 -}
 
-import Actor.Core as Core exposing (Actor, Process)
+import Actor.Core as Core exposing (Process)
 import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext)
 import Actor.P2P as P2P exposing (Subject)
 import Actor.PubSub as PubSub
 import Platform
 import Procedure
 import Procedure.Program
+import Supervisor
 import Time
+import Types exposing (AppMsg(..))
+import Worker
+
 
 
 -- PORTS
@@ -27,17 +31,6 @@ port logPort : String -> Cmd msg
 
 
 port exitPort : () -> Cmd msg
-
-
-
--- APP MSG
-
-
-type AppMsg
-    = WorkerJob Int
-    | WorkerReport String
-    | TopicEvent String
-    | Heartbeat Time.Posix
 
 
 
@@ -86,59 +79,6 @@ ctx =
 
 
 
--- ACTORS
-
-
-supervisorActor : Actor (Subject AppMsg AppMsg) (Subject AppMsg AppMsg) AppMsg
-supervisorActor =
-    { init = \inbox -> ( inbox, Cmd.none )
-    , update =
-        \msg model ->
-            case msg of
-                WorkerReport report ->
-                    ( model, logPort ("Supervisor got report: " ++ report) )
-
-                _ ->
-                    ( model, Cmd.none )
-    , subscriptions = \_ -> Sub.none
-    }
-
-
-type alias WorkerModel =
-    { inbox : Subject AppMsg AppMsg
-    , jobCount : Int
-    }
-
-
-workerActor : Actor (Subject AppMsg AppMsg) WorkerModel AppMsg
-workerActor =
-    { init = \inbox -> ( { inbox = inbox, jobCount = 0 }, Cmd.none )
-    , update =
-        \msg model ->
-            case msg of
-                WorkerJob n ->
-                    let
-                        newCount =
-                            model.jobCount + 1
-                    in
-                    ( { model | jobCount = newCount }
-                    , logPort ("Worker processing job #" ++ String.fromInt n ++ " (total: " ++ String.fromInt newCount ++ ")")
-                    )
-
-                Heartbeat time ->
-                    ( model
-                    , logPort ("Worker heartbeat at " ++ String.fromInt (Time.posixToMillis time) ++ "ms (jobs done: " ++ String.fromInt model.jobCount ++ ")")
-                    )
-
-                _ ->
-                    ( model, Cmd.none )
-    , subscriptions =
-        \_ ->
-            Time.every 2000 Heartbeat
-    }
-
-
-
 -- MAIN
 
 
@@ -169,7 +109,7 @@ initProcedure =
         |> Procedure.andThen (\() -> P2P.subject ctx identity Just)
         |> Procedure.andThen
             (\reportInbox ->
-                Core.spawn ctx supervisorActor reportInbox
+                Core.spawn ctx (Supervisor.actor logPort) reportInbox
                     |> Procedure.andThen
                         (\supProcess ->
                             Procedure.do (logPort "Supervisor spawned")
@@ -185,7 +125,7 @@ initProcedure =
                 P2P.subject ctx identity Just
                     |> Procedure.andThen
                         (\workerInbox ->
-                            Core.spawn ctx workerActor workerInbox
+                            Core.spawn ctx (Worker.actor logPort) workerInbox
                                 |> Procedure.andThen
                                     (\workerProcess ->
                                         Procedure.do (logPort "Worker spawned")
