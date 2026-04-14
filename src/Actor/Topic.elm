@@ -5,10 +5,12 @@ module Actor.Topic exposing
     , Group
     , Partition
     , Offset
-    , createTopic
+    , topic
     , publish
     , publishKeyed
-    , createConsumer
+    , publishWithPartitionKey
+    , subscribeGroup
+    , consumer
     , poll
     , commit
     , seekToBeginning
@@ -19,9 +21,12 @@ module Actor.Topic exposing
 {-| Kafka-style partitioned log topics with consumer groups,
 using elm-procedure for async composition.
 
+Topics and consumers carry a codec for encoding/decoding between
+the payload type `a` and the system message type `msg`.
+
 @docs Topic, Consumer, Key, Group, Partition, Offset
-@docs createTopic, publish, publishKeyed
-@docs createConsumer, poll, commit
+@docs topic, publish, publishKeyed, publishWithPartitionKey
+@docs subscribeGroup, consumer, poll, commit
 @docs seekToBeginning, seekToEnd, seekToOffset
 
 -}
@@ -32,15 +37,19 @@ import Procedure
 
 
 {-| An opaque handle to a topic.
+
+`msg` is the system message type, `a` is the payload type.
 -}
-type Topic
-    = Topic TopicId
+type Topic msg a
+    = Topic TopicId (a -> msg) (msg -> Maybe a)
 
 
 {-| An opaque handle to a consumer within a consumer group.
+
+`msg` is the system message type, `a` is the payload type.
 -}
-type Consumer
-    = Consumer TopicId ConsumerId
+type Consumer msg a
+    = Consumer TopicId ConsumerId (a -> msg) (msg -> Maybe a)
 
 
 type alias Key =
@@ -59,33 +68,35 @@ type alias Offset =
     Int
 
 
-{-| Create a new topic with the given name and number of partitions.
+{-| Create a new topic with the specified number of partitions
+and an encoder/decoder codec.
 -}
-createTopic : SystemContext appMsg msg -> String -> Int -> Procedure.Procedure Never Topic msg
-createTopic ctx name numPartitions =
+topic : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> { partitions : Int } -> Procedure.Procedure Never (Topic msg a) parentMsg
+topic ctx encode decode config =
     Procedure.fetch
         (\tagger ->
             let
                 op system =
                     let
                         ( newSystem, tid ) =
-                            Runtime.createTopic name numPartitions system
+                            Runtime.createTopic "" config.partitions system
                     in
-                    ( newSystem, msgToCmd (tagger (Topic tid)) )
+                    ( newSystem, msgToCmd (tagger (Topic tid encode decode)) )
             in
             msgToCmd (ctx.runOp op)
         )
 
 
 {-| Publish a message to a topic (round-robin partition assignment).
+Encodes the payload before storing.
 -}
-publish : SystemContext appMsg msg -> Topic -> appMsg -> Procedure.Procedure Never () msg
-publish ctx (Topic tid) appMsg =
+publish : SystemContext msg parentMsg -> Topic msg a -> a -> Procedure.Procedure Never () parentMsg
+publish ctx (Topic tid encode _) value =
     Procedure.fetch
         (\tagger ->
             let
                 op system =
-                    ( Runtime.publishToTopic tid appMsg system
+                    ( Runtime.publishToTopic tid (encode value) system
                     , msgToCmd (tagger ())
                     )
             in
@@ -94,14 +105,15 @@ publish ctx (Topic tid) appMsg =
 
 
 {-| Publish a keyed message to a topic (key determines partition).
+Encodes the payload before storing.
 -}
-publishKeyed : SystemContext appMsg msg -> Topic -> Key -> appMsg -> Procedure.Procedure Never () msg
-publishKeyed ctx (Topic tid) key appMsg =
+publishKeyed : SystemContext msg parentMsg -> Topic msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
+publishKeyed ctx (Topic tid encode _) key value =
     Procedure.fetch
         (\tagger ->
             let
                 op system =
-                    ( Runtime.publishKeyedToTopic tid key appMsg system
+                    ( Runtime.publishKeyedToTopic tid key (encode value) system
                     , msgToCmd (tagger ())
                     )
             in
@@ -109,33 +121,45 @@ publishKeyed ctx (Topic tid) key appMsg =
         )
 
 
-{-| Create a consumer for a topic within a consumer group.
+{-| Publish using a function that derives a key from the payload.
 -}
-createConsumer : SystemContext appMsg msg -> Topic -> Group -> Procedure.Procedure Never (Maybe Consumer) msg
-createConsumer ctx (Topic tid) groupId =
+publishWithPartitionKey : SystemContext msg parentMsg -> (a -> Key) -> Topic msg a -> a -> Procedure.Procedure Never () parentMsg
+publishWithPartitionKey ctx toKey tp a =
+    publishKeyed ctx tp (toKey a) a
+
+
+{-| Subscribe a consumer group to a topic.
+In this simulation, this is a no-op — use poll/commit instead.
+-}
+subscribeGroup : ActorSystem msg -> Topic msg a -> Group -> Sub (Maybe a)
+subscribeGroup _ _ _ =
+    Sub.none
+
+
+{-| Create a consumer for a topic within a consumer group.
+The consumer inherits the codec from the topic.
+-}
+consumer : SystemContext msg parentMsg -> Topic msg a -> Group -> Procedure.Procedure Never (Consumer msg a) parentMsg
+consumer ctx (Topic tid encode decode) groupId =
     Procedure.fetch
         (\tagger ->
             let
                 op system =
                     let
-                        ( newSystem, maybeIds ) =
+                        ( newSystem, ( topicId, consumerId ) ) =
                             Runtime.createConsumer tid groupId system
                     in
-                    case maybeIds of
-                        Nothing ->
-                            ( newSystem, msgToCmd (tagger Nothing) )
-
-                        Just ( topicId, consumerId ) ->
-                            ( newSystem, msgToCmd (tagger (Just (Consumer topicId consumerId))) )
+                    ( newSystem, msgToCmd (tagger (Consumer topicId consumerId encode decode)) )
             in
             msgToCmd (ctx.runOp op)
         )
 
 
 {-| Poll for new messages from a consumer. Advances the consumer's current offset.
+Decodes each message from the system message type to the payload type.
 -}
-poll : SystemContext appMsg msg -> Consumer -> Procedure.Procedure Never (List appMsg) msg
-poll ctx (Consumer tid cid) =
+poll : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never (List a) parentMsg
+poll ctx (Consumer tid cid _ decode) =
     Procedure.fetch
         (\tagger ->
             let
@@ -144,7 +168,7 @@ poll ctx (Consumer tid cid) =
                         ( newSystem, messages ) =
                             Runtime.pollConsumer tid cid system
                     in
-                    ( newSystem, msgToCmd (tagger messages) )
+                    ( newSystem, msgToCmd (tagger (List.filterMap decode messages)) )
             in
             msgToCmd (ctx.runOp op)
         )
@@ -152,8 +176,8 @@ poll ctx (Consumer tid cid) =
 
 {-| Commit the consumer's current offset (marks messages as processed).
 -}
-commit : SystemContext appMsg msg -> Consumer -> Procedure.Procedure Never () msg
-commit ctx (Consumer tid cid) =
+commit : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never () parentMsg
+commit ctx (Consumer tid cid _ _) =
     Procedure.fetch
         (\tagger ->
             let
@@ -168,8 +192,8 @@ commit ctx (Consumer tid cid) =
 
 {-| Seek the consumer to the beginning of all partitions.
 -}
-seekToBeginning : SystemContext appMsg msg -> Consumer -> Procedure.Procedure Never () msg
-seekToBeginning ctx (Consumer tid cid) =
+seekToBeginning : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never () parentMsg
+seekToBeginning ctx (Consumer tid cid _ _) =
     Procedure.fetch
         (\tagger ->
             let
@@ -184,8 +208,8 @@ seekToBeginning ctx (Consumer tid cid) =
 
 {-| Seek the consumer to the end of all partitions.
 -}
-seekToEnd : SystemContext appMsg msg -> Consumer -> Procedure.Procedure Never () msg
-seekToEnd ctx (Consumer tid cid) =
+seekToEnd : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never () parentMsg
+seekToEnd ctx (Consumer tid cid _ _) =
     Procedure.fetch
         (\tagger ->
             let
@@ -200,8 +224,8 @@ seekToEnd ctx (Consumer tid cid) =
 
 {-| Seek the consumer to a specific offset on a specific partition.
 -}
-seekToOffset : SystemContext appMsg msg -> Consumer -> Partition -> Offset -> Procedure.Procedure Never () msg
-seekToOffset ctx (Consumer tid cid) partition offset =
+seekToOffset : SystemContext msg parentMsg -> Consumer msg a -> Partition -> Offset -> Procedure.Procedure Never () parentMsg
+seekToOffset ctx (Consumer tid cid _ _) partition offset =
     Procedure.fetch
         (\tagger ->
             let

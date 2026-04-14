@@ -282,11 +282,20 @@ publishKeyedToTopic tid key msg system =
             }
 
 
-createConsumer : TopicId -> String -> ActorSystem appMsg -> ( ActorSystem appMsg, Maybe ( TopicId, ConsumerId ) )
+createConsumer : TopicId -> String -> ActorSystem appMsg -> ( ActorSystem appMsg, ( TopicId, ConsumerId ) )
 createConsumer tid groupId system =
     case Dict.get tid system.topics of
         Nothing ->
-            ( system, Nothing )
+            let
+                entry =
+                    TopicStore.initTopic tid 1
+
+                ( updatedEntry, cid ) =
+                    TopicStore.initConsumer groupId entry
+            in
+            ( { system | topics = Dict.insert tid updatedEntry system.topics }
+            , ( tid, cid )
+            )
 
         Just entry ->
             let
@@ -294,7 +303,7 @@ createConsumer tid groupId system =
                     TopicStore.initConsumer groupId entry
             in
             ( { system | topics = Dict.insert tid updatedEntry system.topics }
-            , Just ( tid, cid )
+            , ( tid, cid )
             )
 
 

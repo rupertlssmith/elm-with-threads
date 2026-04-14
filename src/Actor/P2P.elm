@@ -5,12 +5,13 @@ module Actor.P2P exposing
     , subject
     , send
     , sendKeyed
-    , fromSubject
+    , all
     , selector
     , selectMap
     , map
     , filter
     , orElse
+    , withTimeout
     , select
     , subscribe
     )
@@ -24,9 +25,12 @@ notification, JS echoes it back, and the subscribe Sub picks it up.
 Selectors have two type parameters: `msg` is the input message type,
 `result` is the output type after transformation.
 
+Subjects carry a codec for encoding/decoding between the payload type `a`
+and the system message type `msg`.
+
 @docs Subject, Selector, Key
 @docs subject, send, sendKeyed
-@docs fromSubject, selector, selectMap, map, filter, orElse
+@docs all, selector, selectMap, map, filter, orElse, withTimeout
 @docs select, subscribe
 
 -}
@@ -39,9 +43,12 @@ import Procedure
 
 {-| A subject is a named mailbox owned by a process. Other actors send messages
 to a subject; the owning process receives them.
+
+`msg` is the system message type, `a` is the payload type.
+The subject carries an encoder `(a -> msg)` and decoder `(msg -> Maybe a)`.
 -}
-type Subject a
-    = Subject SubjectId
+type Subject msg a
+    = Subject SubjectId (a -> msg) (msg -> Maybe a)
 
 
 {-| A selector matches incoming messages and transforms them.
@@ -57,10 +64,10 @@ type alias Key =
     String
 
 
-{-| Create a new subject.
+{-| Create a new subject with an encoder/decoder codec.
 -}
-subject : SystemContext a msg -> Procedure.Procedure Never (Subject a) msg
-subject ctx =
+subject : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Subject msg a) parentMsg
+subject ctx encode decode =
     Procedure.fetch
         (\tagger ->
             let
@@ -69,24 +76,25 @@ subject ctx =
                         ( newSystem, sid ) =
                             Runtime.createSubject system
                     in
-                    ( newSystem, msgToCmd (tagger (Subject sid)) )
+                    ( newSystem, msgToCmd (tagger (Subject sid encode decode)) )
             in
             msgToCmd (ctx.runOp op)
         )
 
 
-{-| Send a message to a subject. Stores the message and fires a port
-notification. Subscribers are woken via the port-bounce echo.
+{-| Send a message to a subject. Encodes the payload, stores it in the
+message store, and fires a port notification. Subscribers are woken via
+the port-bounce echo.
 -}
-send : SystemContext a msg -> Subject a -> a -> Procedure.Procedure Never () msg
-send ctx (Subject sid) a =
+send : SystemContext msg parentMsg -> Subject msg a -> a -> Procedure.Procedure Never () parentMsg
+send ctx (Subject sid encode _) value =
     Procedure.fetch
         (\tagger ->
             let
                 op system =
                     let
                         ( newSystem, messageId ) =
-                            Runtime.storeMessage sid a system
+                            Runtime.storeMessage sid (encode value) system
                     in
                     ( newSystem
                     , Cmd.batch
@@ -102,19 +110,20 @@ send ctx (Subject sid) a =
 
 {-| Send a keyed message to a subject.
 -}
-sendKeyed : SystemContext a msg -> Subject a -> Key -> a -> Procedure.Procedure Never () msg
+sendKeyed : SystemContext msg parentMsg -> Subject msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
 sendKeyed ctx subj _ a =
     send ctx subj a
 
 
 {-| Create a selector that accepts messages from a specific subject.
+Uses the subject's decoder to extract the payload.
 -}
-fromSubject : Subject a -> Selector a a
-fromSubject (Subject sid) =
+all : Subject msg a -> Selector msg a
+all (Subject sid _ decode) =
     Selector
-        (\msg sourceSubject ->
+        (\sysMsg sourceSubject ->
             if sourceSubject == sid then
-                Just msg
+                decode sysMsg
 
             else
                 Nothing
@@ -129,16 +138,23 @@ selector =
 
 
 {-| Add a subject source to a selector with a transformation function.
+Decodes the payload from the subject, applies the transform, and feeds
+the result through the inner selector.
 -}
-selectMap : Subject a -> (a -> result) -> Selector a result -> Selector a result
-selectMap (Subject sid) transform (Selector sel) =
+selectMap : Subject msg a -> (a -> msg) -> Selector msg result -> Selector msg result
+selectMap (Subject sid _ decode) transform (Selector sel) =
     Selector
-        (\msg sourceSubject ->
+        (\incomingMsg sourceSubject ->
             if sourceSubject == sid then
-                Just (transform msg)
+                case decode incomingMsg of
+                    Just aValue ->
+                        sel (transform aValue) sourceSubject
+
+                    Nothing ->
+                        sel incomingMsg sourceSubject
 
             else
-                sel msg sourceSubject
+                sel incomingMsg sourceSubject
         )
 
 
@@ -182,9 +198,17 @@ orElse (Selector left) (Selector right) =
         )
 
 
+{-| Add a timeout with a default value to a selector.
+In this simulation, timeouts are not enforced — the default is ignored.
+-}
+withTimeout : Float -> result -> Selector msg result -> Selector msg result
+withTimeout _ _ sel =
+    sel
+
+
 {-| One-shot select: scan the message store for the first matching message.
 -}
-select : SystemContext a msg -> Selector a result -> Procedure.Procedure Never (Maybe result) msg
+select : SystemContext msg parentMsg -> Selector msg result -> Procedure.Procedure Never (Maybe result) parentMsg
 select ctx (Selector sel) =
     Procedure.fetch
         (\tagger ->
@@ -208,7 +232,7 @@ select ctx (Selector sel) =
 via port-bounce. Each send fires a port notification that bounces back
 through JS; this Sub picks up matching messages from the store.
 -}
-subscribe : ActorSystem a -> Selector a result -> Sub (Maybe result)
+subscribe : ActorSystem msg -> Selector msg result -> Sub (Maybe result)
 subscribe system (Selector sel) =
     Actor.Ports.onP2PSend
         (\{ messageId } ->

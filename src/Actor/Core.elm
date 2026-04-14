@@ -1,16 +1,21 @@
 module Actor.Core exposing
     ( Actor
+    , Process
     , spawn
     , self
     , kill
     )
 
 {-| Actor lifecycle management using elm-procedure for async composition.
+
+@docs Actor, Process
+@docs spawn, self, kill
+
 -}
 
 import Actor.Internal.Mailbox as Mailbox
 import Actor.Internal.Runtime as Runtime exposing (ActorSystem, ProcessEntry(..), SystemContext, msgToCmd)
-import Actor.Internal.Types exposing (Process(..), ProcessId)
+import Actor.Internal.Types as InternalTypes exposing (Process(..), ProcessId)
 import Procedure
 
 
@@ -21,6 +26,12 @@ type alias Actor flags model msg =
     , update : msg -> model -> ( model, Cmd msg )
     , subscriptions : model -> Sub msg
     }
+
+
+{-| An opaque handle to a running actor process.
+-}
+type alias Process msg =
+    InternalTypes.Process msg
 
 
 {-| Spawn a new actor process with the given flags.

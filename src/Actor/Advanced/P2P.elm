@@ -1,21 +1,25 @@
 module Actor.Advanced.P2P exposing
-    ( Meta
-    , Envelope
-    , Key
-    , Subject
+    ( Subject
     , Selector
+    , Key
+    , Meta
+    , Envelope
     , subject
     , send
     , sendKeyed
     , resendAsPossibleDuplicate
-    , fromSubject
+    , sendWithPartitionKey
+    , all
     , selector
     , selectMap
     , map
     , filter
     , orElse
+    , withTimeout
     , select
+    , selectWithMeta
     , subscribe
+    , subscribeWithMeta
     )
 
 {-| Enriched P2P messaging with metadata envelopes.
@@ -26,11 +30,13 @@ Subscribe returns a real Elm Sub via port-bounce.
 Selectors have two type parameters: `msg` is the input message type,
 `result` is the output type after transformation.
 
-@docs Meta, Envelope, Key
-@docs Subject, Selector
-@docs subject, send, sendKeyed, resendAsPossibleDuplicate
-@docs fromSubject, selector, selectMap, map, filter, orElse
-@docs select, subscribe
+Subjects carry a codec for encoding/decoding between the payload type `a`
+and the system message type `msg`.
+
+@docs Subject, Selector, Key, Meta, Envelope
+@docs subject, send, sendKeyed, resendAsPossibleDuplicate, sendWithPartitionKey
+@docs all, selector, selectMap, map, filter, orElse, withTimeout
+@docs select, selectWithMeta, subscribe, subscribeWithMeta
 
 -}
 
@@ -38,7 +44,25 @@ import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext, m
 import Actor.Internal.Types exposing (SubjectId)
 import Actor.Ports
 import Procedure
-import Time
+
+
+{-| An advanced subject wraps a subject id with an encoder/decoder codec.
+
+`msg` is the system message type, `a` is the payload type.
+-}
+type Subject msg a
+    = Subject SubjectId (a -> msg) (msg -> Maybe a)
+
+
+{-| A selector for advanced P2P with metadata.
+`msg` is the input message type, `result` is the output type.
+-}
+type Selector msg result
+    = Selector (msg -> SubjectId -> Maybe result)
+
+
+type alias Key =
+    String
 
 
 {-| Metadata attached to each message.
@@ -47,8 +71,6 @@ type alias Meta =
     { key : Maybe Key
     , possibleDuplicate : Bool
     , sequence : Maybe Int
-    , timestamp : Time.Posix
-    , sender : Maybe ProcessId
     }
 
 
@@ -60,27 +82,10 @@ type alias Envelope a =
     }
 
 
-type alias Key =
-    String
-
-
-{-| An advanced subject wraps a subject id.
+{-| Create a new advanced subject with an encoder/decoder codec.
 -}
-type Subject a
-    = Subject SubjectId
-
-
-{-| A selector for advanced P2P with metadata.
-`msg` is the input message type, `result` is the output type.
--}
-type Selector msg result
-    = Selector (msg -> SubjectId -> Maybe result)
-
-
-{-| Create a new advanced subject.
--}
-subject : SystemContext a msg -> Procedure.Procedure Never (Subject a) msg
-subject ctx =
+subject : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Subject msg a) parentMsg
+subject ctx encode decode =
     Procedure.fetch
         (\tagger ->
             let
@@ -89,24 +94,24 @@ subject ctx =
                         ( newSystem, sid ) =
                             Runtime.createSubject system
                     in
-                    ( newSystem, msgToCmd (tagger (Subject sid)) )
+                    ( newSystem, msgToCmd (tagger (Subject sid encode decode)) )
             in
             msgToCmd (ctx.runOp op)
         )
 
 
-{-| Send a message to an advanced subject. Stores the message and fires
-a port notification for subscribers.
+{-| Send a message to an advanced subject. Encodes the payload, stores it,
+and fires a port notification for subscribers.
 -}
-send : SystemContext a msg -> Subject a -> a -> Procedure.Procedure Never () msg
-send ctx (Subject sid) a =
+send : SystemContext msg parentMsg -> Subject msg a -> a -> Procedure.Procedure Never () parentMsg
+send ctx (Subject sid encode _) value =
     Procedure.fetch
         (\tagger ->
             let
                 op system =
                     let
                         ( newSystem, messageId ) =
-                            Runtime.storeMessage sid a system
+                            Runtime.storeMessage sid (encode value) system
                     in
                     ( newSystem
                     , Cmd.batch
@@ -122,26 +127,35 @@ send ctx (Subject sid) a =
 
 {-| Send a keyed message to an advanced subject.
 -}
-sendKeyed : SystemContext a msg -> Subject a -> Key -> a -> Procedure.Procedure Never () msg
+sendKeyed : SystemContext msg parentMsg -> Subject msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
 sendKeyed ctx subj _ a =
     send ctx subj a
 
 
 {-| Resend a message marked as a possible duplicate.
 -}
-resendAsPossibleDuplicate : SystemContext a msg -> Subject a -> Key -> a -> Procedure.Procedure Never () msg
+resendAsPossibleDuplicate : SystemContext msg parentMsg -> Subject msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
 resendAsPossibleDuplicate ctx subj _ a =
     send ctx subj a
 
 
-{-| Create a selector that accepts messages from a specific subject.
+{-| Send using a function that derives a partition key from the payload.
+In this simulation, the key is ignored (no real partitioning).
 -}
-fromSubject : Subject a -> Selector a a
-fromSubject (Subject sid) =
+sendWithPartitionKey : SystemContext msg parentMsg -> (a -> Key) -> Subject msg a -> a -> Procedure.Procedure Never () parentMsg
+sendWithPartitionKey ctx _ subj a =
+    send ctx subj a
+
+
+{-| Create a selector that accepts messages from a specific subject.
+Uses the subject's decoder to extract the payload.
+-}
+all : Subject msg a -> Selector msg a
+all (Subject sid _ decode) =
     Selector
-        (\msg sourceSubject ->
+        (\sysMsg sourceSubject ->
             if sourceSubject == sid then
-                Just msg
+                decode sysMsg
 
             else
                 Nothing
@@ -156,16 +170,23 @@ selector =
 
 
 {-| Add a subject source to a selector with a transformation.
+Decodes the payload from the subject, applies the transform, and feeds
+the result through the inner selector.
 -}
-selectMap : Subject a -> (a -> result) -> Selector a result -> Selector a result
-selectMap (Subject sid) transform (Selector sel) =
+selectMap : Subject msg a -> (a -> msg) -> Selector msg result -> Selector msg result
+selectMap (Subject sid _ decode) transform (Selector sel) =
     Selector
-        (\msg sourceSubject ->
+        (\incomingMsg sourceSubject ->
             if sourceSubject == sid then
-                Just (transform msg)
+                case decode incomingMsg of
+                    Just aValue ->
+                        sel (transform aValue) sourceSubject
+
+                    Nothing ->
+                        sel incomingMsg sourceSubject
 
             else
-                sel msg sourceSubject
+                sel incomingMsg sourceSubject
         )
 
 
@@ -209,9 +230,17 @@ orElse (Selector left) (Selector right) =
         )
 
 
+{-| Add a timeout with a default value to a selector.
+In this simulation, timeouts are not enforced — the default is ignored.
+-}
+withTimeout : Float -> result -> Selector msg result -> Selector msg result
+withTimeout _ _ sel =
+    sel
+
+
 {-| One-shot select from message store.
 -}
-select : SystemContext a msg -> Selector a result -> Procedure.Procedure Never (Maybe result) msg
+select : SystemContext msg parentMsg -> Selector msg result -> Procedure.Procedure Never (Maybe result) parentMsg
 select ctx (Selector sel) =
     Procedure.fetch
         (\tagger ->
@@ -231,16 +260,69 @@ select ctx (Selector sel) =
         )
 
 
+{-| One-shot select using a meta-aware selector.
+The selector operates on `( Meta, msg )` tuples.
+In this simulation, default metadata is provided.
+-}
+selectWithMeta : SystemContext msg parentMsg -> Selector ( Meta, msg ) result -> Procedure.Procedure Never (Maybe result) parentMsg
+selectWithMeta ctx (Selector sel) =
+    Procedure.fetch
+        (\tagger ->
+            let
+                op system =
+                    let
+                        defaultMeta =
+                            { key = Nothing
+                            , possibleDuplicate = False
+                            , sequence = Nothing
+                            }
+
+                        result =
+                            system
+                                |> Runtime.messageStoreValues
+                                |> List.filterMap
+                                    (\entry -> sel ( defaultMeta, entry.message ) entry.subjectId)
+                                |> List.head
+                    in
+                    ( system, msgToCmd (tagger result) )
+            in
+            msgToCmd (ctx.runOp op)
+        )
+
+
 {-| Subscribe to messages matching a selector. Returns a real Elm Sub
 via port-bounce.
 -}
-subscribe : ActorSystem a -> Selector a result -> Sub (Maybe result)
+subscribe : ActorSystem msg -> Selector msg result -> Sub (Maybe result)
 subscribe system (Selector sel) =
     Actor.Ports.onP2PSend
         (\{ messageId } ->
             case Runtime.lookupMessage messageId system of
                 Just entry ->
                     sel entry.message entry.subjectId
+
+                Nothing ->
+                    Nothing
+        )
+
+
+{-| Subscribe using a meta-aware selector. Returns a real Elm Sub via port-bounce.
+In this simulation, default metadata is provided.
+-}
+subscribeWithMeta : ActorSystem msg -> Selector ( Meta, msg ) result -> Sub (Maybe result)
+subscribeWithMeta system (Selector sel) =
+    let
+        defaultMeta =
+            { key = Nothing
+            , possibleDuplicate = False
+            , sequence = Nothing
+            }
+    in
+    Actor.Ports.onP2PSend
+        (\{ messageId } ->
+            case Runtime.lookupMessage messageId system of
+                Just entry ->
+                    sel ( defaultMeta, entry.message ) entry.subjectId
 
                 Nothing ->
                     Nothing
