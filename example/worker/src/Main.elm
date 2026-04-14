@@ -79,6 +79,101 @@ ctx =
 
 
 
+-- HELPERS
+
+
+log : String -> Procedure.Procedure Never () Msg
+log message =
+    Procedure.do (logPort message)
+
+
+registerRoute : Process AppMsg -> P2P.Selector AppMsg AppMsg -> Procedure.Procedure Never () Msg
+registerRoute process sel =
+    Procedure.do (Runtime.msgToCmd (RegisterRoute process sel))
+
+
+createSubject : Procedure.Procedure Never (Subject AppMsg AppMsg) Msg
+createSubject =
+    P2P.subject ctx identity Just
+
+
+
+-- INIT PROCEDURES
+
+
+spawnSupervisor : Procedure.Procedure Never (Subject AppMsg AppMsg) Msg
+spawnSupervisor =
+    createSubject
+        |> Procedure.andThen
+            (\reportInbox ->
+                Core.spawn ctx (Supervisor.actor logPort) reportInbox
+                    |> Procedure.andThen (\process -> registerRoute process (P2P.all reportInbox))
+                    |> Procedure.andThen (\() -> log "Supervisor spawned")
+                    |> Procedure.map (\() -> reportInbox)
+            )
+
+
+spawnWorker : Subject AppMsg AppMsg -> Procedure.Procedure Never ( Subject AppMsg AppMsg, Subject AppMsg AppMsg ) Msg
+spawnWorker reportInbox =
+    createSubject
+        |> Procedure.andThen
+            (\workerInbox ->
+                Core.spawn ctx (Worker.actor logPort) workerInbox
+                    |> Procedure.andThen (\process -> registerRoute process (P2P.all workerInbox))
+                    |> Procedure.andThen (\() -> log "Worker spawned")
+                    |> Procedure.map (\() -> ( reportInbox, workerInbox ))
+            )
+
+
+setupPubSub : Procedure.Procedure Never (PubSub.Topic AppMsg AppMsg) Msg
+setupPubSub =
+    PubSub.topic ctx identity Just
+        |> Procedure.andThen
+            (\topic ->
+                log "Events pub/sub topic created"
+                    |> Procedure.andThen (\() -> Procedure.do (Runtime.msgToCmd (SetEventsTopic topic)))
+                    |> Procedure.map (\() -> topic)
+            )
+
+
+publishEvents : PubSub.Topic AppMsg AppMsg -> Procedure.Procedure Never () Msg
+publishEvents topic =
+    PubSub.publish ctx topic (TopicEvent "system-started")
+        |> Procedure.andThen (\() -> PubSub.publish ctx topic (TopicEvent "supervisor-ready"))
+        |> Procedure.andThen (\() -> PubSub.publish ctx topic (TopicEvent "worker-spawned"))
+        |> Procedure.andThen (\() -> log "Published 3 events to pub/sub topic")
+
+
+sendJobs : Subject AppMsg AppMsg -> Procedure.Procedure Never () Msg
+sendJobs workerInbox =
+    P2P.send ctx workerInbox (WorkerJob 1)
+        |> Procedure.andThen (\() -> P2P.send ctx workerInbox (WorkerJob 2))
+        |> Procedure.andThen (\() -> P2P.send ctx workerInbox (WorkerJob 3))
+        |> Procedure.andThen (\() -> log "Sent 3 jobs to worker")
+
+
+sendReport : Subject AppMsg AppMsg -> Procedure.Procedure Never () Msg
+sendReport reportInbox =
+    P2P.send ctx reportInbox (WorkerReport "Jobs queued")
+
+
+initProcedure : Procedure.Procedure Never () Msg
+initProcedure =
+    log "=== elm-actor-kafka started ==="
+        |> Procedure.andThen (\() -> spawnSupervisor)
+        |> Procedure.andThen spawnWorker
+        |> Procedure.andThen
+            (\( reportInbox, workerInbox ) ->
+                setupPubSub
+                    |> Procedure.andThen publishEvents
+                    |> Procedure.andThen (\() -> sendJobs workerInbox)
+                    |> Procedure.andThen (\() -> sendReport reportInbox)
+            )
+        |> Procedure.andThen (\() -> log "--- Messages sent, delivery via port-bounce Sub ---")
+        |> Procedure.andThen (\() -> log "=== Init complete ===")
+
+
+
 -- MAIN
 
 
@@ -102,64 +197,8 @@ init _ =
     )
 
 
-initProcedure : Procedure.Procedure Never () Msg
-initProcedure =
-    Procedure.do (logPort "=== elm-actor-kafka started ===")
-        -- Create subjects first, then spawn actors with them as flags
-        |> Procedure.andThen (\() -> P2P.subject ctx identity Just)
-        |> Procedure.andThen
-            (\reportInbox ->
-                Core.spawn ctx (Supervisor.actor logPort) reportInbox
-                    |> Procedure.andThen
-                        (\supProcess ->
-                            Procedure.do (logPort "Supervisor spawned")
-                                |> Procedure.andThen
-                                    (\() ->
-                                        Procedure.do (Runtime.msgToCmd (RegisterRoute supProcess (P2P.all reportInbox)))
-                                    )
-                                |> Procedure.map (\() -> reportInbox)
-                        )
-            )
-        |> Procedure.andThen
-            (\reportInbox ->
-                P2P.subject ctx identity Just
-                    |> Procedure.andThen
-                        (\workerInbox ->
-                            Core.spawn ctx (Worker.actor logPort) workerInbox
-                                |> Procedure.andThen
-                                    (\workerProcess ->
-                                        Procedure.do (logPort "Worker spawned")
-                                            |> Procedure.andThen
-                                                (\() ->
-                                                    Procedure.do (Runtime.msgToCmd (RegisterRoute workerProcess (P2P.all workerInbox)))
-                                                )
-                                            |> Procedure.map (\() -> ( reportInbox, workerInbox ))
-                                    )
-                        )
-            )
-        |> Procedure.andThen
-            (\( reportInbox, workerInbox ) ->
-                PubSub.topic ctx identity Just
-                    |> Procedure.andThen
-                        (\eventsTopic ->
-                            Procedure.do (logPort "Events pub/sub topic created")
-                                |> Procedure.andThen (\() -> Procedure.do (Runtime.msgToCmd (SetEventsTopic eventsTopic)))
-                                -- Publish events
-                                |> Procedure.andThen (\() -> PubSub.publish ctx eventsTopic (TopicEvent "system-started"))
-                                |> Procedure.andThen (\() -> PubSub.publish ctx eventsTopic (TopicEvent "supervisor-ready"))
-                                |> Procedure.andThen (\() -> PubSub.publish ctx eventsTopic (TopicEvent "worker-spawned"))
-                                |> Procedure.andThen (\() -> Procedure.do (logPort "Published 3 events to pub/sub topic"))
-                                -- Send jobs to worker
-                                |> Procedure.andThen (\() -> P2P.send ctx workerInbox (WorkerJob 1))
-                                |> Procedure.andThen (\() -> P2P.send ctx workerInbox (WorkerJob 2))
-                                |> Procedure.andThen (\() -> P2P.send ctx workerInbox (WorkerJob 3))
-                                |> Procedure.andThen (\() -> Procedure.do (logPort "Sent 3 jobs to worker"))
-                                -- Send report to supervisor
-                                |> Procedure.andThen (\() -> P2P.send ctx reportInbox (WorkerReport "Jobs queued"))
-                                |> Procedure.andThen (\() -> Procedure.do (logPort "--- Messages sent, delivery via port-bounce Sub ---"))
-                                |> Procedure.andThen (\() -> Procedure.do (logPort "=== Init complete ==="))
-                        )
-            )
+
+-- UPDATE
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -211,6 +250,10 @@ update msg model =
 
         NoOp ->
             ( model, Cmd.none )
+
+
+
+-- SUBSCRIPTIONS
 
 
 subscriptions : Model -> Sub Msg
