@@ -1,23 +1,6 @@
-module Actor.Core exposing
-    ( Process
-    , Actor
-    , spawn
-    , self
-    , kill
-    )
+module Actor.Core exposing (..)
 
-import Debug
-import Platform.Cmd exposing (Cmd)
-import Platform.Sub exposing (Sub)
-import Task exposing (Task)
-
-
--- PROCESS / ACTOR LIFECYCLE
-
-
-type Process msg
-    = Process
-
+type Process msg = Process
 
 type alias Actor flags model msg =
     { init : flags -> ( model, Cmd msg )
@@ -25,23 +8,6 @@ type alias Actor flags model msg =
     , subscriptions : model -> Sub msg
     }
 
-
-spawn :
-    Actor flags model msg
-    -> flags
-    -> Task x (Process msg)
-spawn =
-    Debug.todo "spawn"
-
-
-self :
-    Task x (Process msg)
-self =
-    Debug.todo "self"
-
-
-kill :
-    Process msg
-    -> Task x ()
-kill =
-    Debug.todo "kill"
+spawn : Actor flags model msg -> flags -> Task x (Process msg)
+self : Task x (Process msg)
+kill : Process msg -> Task x ()
