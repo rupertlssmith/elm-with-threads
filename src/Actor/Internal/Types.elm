@@ -1,5 +1,6 @@
 module Actor.Internal.Types exposing
-    ( ProcessId
+    ( Process(..)
+    , ProcessId
     , SubjectId
     , SelectorId
     , TopicId
@@ -8,6 +9,12 @@ module Actor.Internal.Types exposing
     , Offset
     , PartitionIndex
     )
+
+
+{-| An opaque handle to a running actor process.
+-}
+type Process msg
+    = Process ProcessId
 
 
 type alias ProcessId =

@@ -3,6 +3,7 @@ module Actor.Internal.Mailbox exposing
     , empty
     , enqueue
     , dequeue
+    , fromList
     , isEmpty
     , toList
     )
@@ -48,3 +49,8 @@ isEmpty (Mailbox front back) =
 toList : Mailbox a -> List a
 toList (Mailbox front back) =
     front ++ List.reverse back
+
+
+fromList : List a -> Mailbox a
+fromList items =
+    Mailbox items []

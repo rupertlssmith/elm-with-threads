@@ -4,11 +4,11 @@ module Actor.Internal.Selector exposing
     , matchSelector
     )
 
-{-| Selector DSL and evaluator for P2P message matching.
+{-| Selector AST and evaluator used by the Runtime's mailbox-based delivery.
+The public-facing function-based Selector lives in Actor.P2P.
 -}
 
 import Actor.Internal.Types exposing (ProcessId, SelectorId, SubjectId)
-import Time
 
 
 type SelectorAst appMsg
@@ -28,7 +28,6 @@ type alias SelectorEntry appMsg =
 
 
 {-| Evaluate a selector AST against an incoming message from a given subject.
-Returns Just result on match, Nothing to skip.
 -}
 matchSelector :
     SelectorAst appMsg

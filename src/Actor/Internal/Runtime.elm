@@ -1,29 +1,38 @@
 module Actor.Internal.Runtime exposing
     ( ActorSystem
+    , MailboxEntry
+    , MessageStoreEntry
     , ProcessEntry(..)
     , ProcessEntryRecord
     , SystemContext
-    , initSystem
-    , msgToCmd
-    , spawnProcess
-    , killProcess
+    , collectActorSubs
+    , collectSubscriptions
+    , commitConsumer
+    , createConsumer
     , createSubject
-    , sendToSubject
-    , sendKeyedToSubject
+    , createTopic
+    , deliverPendingMessages
+    , deliver
+    , deliverToActor
+    , getProcess
+    , initSystem
+    , killProcess
+    , lookupMessage
+    , msgToCmd
+    , pollConsumer
+    , publishKeyedToTopic
+    , publishToTopic
     , registerSelector
     , removeSelector
-    , createTopic
-    , publishToTopic
-    , publishKeyedToTopic
-    , createConsumer
-    , pollConsumer
-    , commitConsumer
     , seekConsumerToBeginning
     , seekConsumerToEnd
     , seekConsumerToOffset
-    , deliverPendingMessages
+    , sendKeyedToSubject
+    , sendToSubject
+    , spawnProcess
+    , storeMessage
+    , messageStoreValues
     , updateTime
-    , getProcess
     )
 
 {-| Core actor system runtime. Manages processes, subjects, selectors, and topics.
@@ -32,7 +41,7 @@ module Actor.Internal.Runtime exposing
 import Actor.Internal.Mailbox as Mailbox exposing (Mailbox)
 import Actor.Internal.Selector as Selector exposing (SelectorAst, SelectorEntry)
 import Actor.Internal.TopicStore as TopicStore exposing (TopicEntry)
-import Actor.Internal.Types exposing (ConsumerId, Key, Offset, PartitionIndex, ProcessId, SelectorId, SubjectId, TopicId)
+import Actor.Internal.Types exposing (ConsumerId, Key, Offset, PartitionIndex, Process(..), ProcessId, SelectorId, SubjectId, TopicId)
 import Dict exposing (Dict)
 import Task
 import Time
@@ -55,6 +64,22 @@ msgToCmd m =
     Task.perform identity (Task.succeed m)
 
 
+{-| A mailbox entry tracks which Subject a message arrived through.
+-}
+type alias MailboxEntry appMsg =
+    { sourceSubject : SubjectId
+    , message : appMsg
+    }
+
+
+{-| A stored message awaiting consumption via port-bounce.
+-}
+type alias MessageStoreEntry appMsg =
+    { subjectId : SubjectId
+    , message : appMsg
+    }
+
+
 {-| A process entry uses a closure-based handleMessage to capture the actor's
 internal model, avoiding existential type issues. Must be a `type` (not alias)
 to break the recursive reference with ActorSystem.
@@ -65,8 +90,9 @@ type ProcessEntry appMsg
 
 type alias ProcessEntryRecord appMsg =
     { id : ProcessId
-    , mailbox : Mailbox appMsg
+    , mailbox : Mailbox (MailboxEntry appMsg)
     , handleMessage : appMsg -> ActorSystem appMsg -> ( ProcessEntry appMsg, ActorSystem appMsg, Cmd appMsg )
+    , actorSubs : Sub appMsg
     }
 
 
@@ -81,17 +107,14 @@ type alias ActorSystem appMsg =
     , nextSubjectId : SubjectId
     , nextSelectorId : SelectorId
     , nextTopicId : TopicId
+    , nextMessageId : Int
     , processes : Dict ProcessId (ProcessEntry appMsg)
     , subjects : Dict SubjectId SubjectEntry
     , selectors : Dict SelectorId (SelectorEntry appMsg)
     , topics : Dict TopicId (TopicEntry appMsg)
+    , messageStore : Dict Int (MessageStoreEntry appMsg)
     , currentTime : Time.Posix
     }
-
-
-unwrap : ProcessEntry appMsg -> ProcessEntryRecord appMsg
-unwrap (ProcessEntry r) =
-    r
 
 
 initSystem : ActorSystem appMsg
@@ -100,29 +123,30 @@ initSystem =
     , nextSubjectId = 1
     , nextSelectorId = 1
     , nextTopicId = 1
+    , nextMessageId = 1
     , processes = Dict.empty
     , subjects = Dict.empty
     , selectors = Dict.empty
     , topics = Dict.empty
+    , messageStore = Dict.empty
     , currentTime = Time.millisToPosix 0
     }
 
 
+{-| Spawn a process. The factory receives the assigned PID and returns
+the full ProcessEntry (including actorSubs).
+-}
 spawnProcess :
-    (ProcessId -> appMsg -> ActorSystem appMsg -> ( ProcessEntry appMsg, ActorSystem appMsg, Cmd appMsg ))
+    (ProcessId -> ProcessEntry appMsg)
     -> ActorSystem appMsg
     -> ( ActorSystem appMsg, ProcessId )
-spawnProcess makeHandler system =
+spawnProcess makeEntry system =
     let
         pid =
             system.nextProcessId
 
         entry =
-            ProcessEntry
-                { id = pid
-                , mailbox = Mailbox.empty
-                , handleMessage = makeHandler pid
-                }
+            makeEntry pid
     in
     ( { system
         | nextProcessId = pid + 1
@@ -148,20 +172,14 @@ killProcess pid system =
     }
 
 
-createSubject : ProcessId -> ActorSystem appMsg -> ( ActorSystem appMsg, SubjectId )
-createSubject ownerPid system =
+createSubject : ActorSystem appMsg -> ( ActorSystem appMsg, SubjectId )
+createSubject system =
     let
         sid =
             system.nextSubjectId
-
-        entry =
-            { id = sid
-            , owner = ownerPid
-            }
     in
     ( { system
         | nextSubjectId = sid + 1
-        , subjects = Dict.insert sid entry system.subjects
       }
     , sid
     )
@@ -174,7 +192,7 @@ sendToSubject sid msg system =
             system
 
         Just subjectEntry ->
-            enqueueToProcess subjectEntry.owner msg system
+            enqueueToProcess subjectEntry.owner sid msg system
 
 
 sendKeyedToSubject : SubjectId -> Key -> appMsg -> ActorSystem appMsg -> ActorSystem appMsg
@@ -182,16 +200,19 @@ sendKeyedToSubject sid _ msg system =
     sendToSubject sid msg system
 
 
-enqueueToProcess : ProcessId -> appMsg -> ActorSystem appMsg -> ActorSystem appMsg
-enqueueToProcess pid msg system =
+enqueueToProcess : ProcessId -> SubjectId -> appMsg -> ActorSystem appMsg -> ActorSystem appMsg
+enqueueToProcess pid sourceSubject msg system =
     case Dict.get pid system.processes of
         Nothing ->
             system
 
         Just (ProcessEntry r) ->
             let
+                entry =
+                    { sourceSubject = sourceSubject, message = msg }
+
                 updatedEntry =
-                    ProcessEntry { r | mailbox = Mailbox.enqueue msg r.mailbox }
+                    ProcessEntry { r | mailbox = Mailbox.enqueue entry r.mailbox }
             in
             { system | processes = Dict.insert pid updatedEntry system.processes }
 
@@ -329,6 +350,8 @@ updateTopicEntry tid f system =
 
 
 {-| Deliver pending messages from all process mailboxes.
+For processes with registered selectors, only messages matching a selector are
+delivered. Non-matching messages remain in the mailbox.
 -}
 deliverPendingMessages : ActorSystem appMsg -> ( ActorSystem appMsg, Cmd appMsg )
 deliverPendingMessages system =
@@ -360,47 +383,198 @@ drainMailbox pid system =
             ( system, Cmd.none )
 
         Just (ProcessEntry r) ->
-            case Mailbox.dequeue r.mailbox of
+            let
+                selectors =
+                    getSelectorsForProcess pid system
+            in
+            if List.isEmpty selectors then
+                drainAllMessages pid r system
+
+            else
+                drainWithSelectors pid r selectors system
+
+
+drainAllMessages : ProcessId -> ProcessEntryRecord appMsg -> ActorSystem appMsg -> ( ActorSystem appMsg, Cmd appMsg )
+drainAllMessages pid r system =
+    case Mailbox.dequeue r.mailbox of
+        Nothing ->
+            ( system, Cmd.none )
+
+        Just ( entry, remainingMailbox ) ->
+            deliverOneMessage pid r entry.message remainingMailbox system
+
+
+drainWithSelectors : ProcessId -> ProcessEntryRecord appMsg -> List (SelectorEntry appMsg) -> ActorSystem appMsg -> ( ActorSystem appMsg, Cmd appMsg )
+drainWithSelectors pid r selectors system =
+    case findFirstMatch selectors (Mailbox.toList r.mailbox) [] of
+        Nothing ->
+            ( system, Cmd.none )
+
+        Just ( transformedMsg, remainingEntries ) ->
+            deliverOneMessage pid r transformedMsg (Mailbox.fromList remainingEntries) system
+
+
+deliverOneMessage : ProcessId -> ProcessEntryRecord appMsg -> appMsg -> Mailbox (MailboxEntry appMsg) -> ActorSystem appMsg -> ( ActorSystem appMsg, Cmd appMsg )
+deliverOneMessage pid r msg remainingMailbox system =
+    let
+        entryWithDrained =
+            ProcessEntry { r | mailbox = remainingMailbox }
+
+        systemWithDrained =
+            { system | processes = Dict.insert pid entryWithDrained system.processes }
+
+        ( ProcessEntry updatedRecord, newSystem, cmd ) =
+            r.handleMessage msg systemWithDrained
+
+        currentMailbox =
+            case Dict.get pid newSystem.processes of
+                Just (ProcessEntry currentR) ->
+                    currentR.mailbox
+
                 Nothing ->
-                    ( system, Cmd.none )
+                    Mailbox.empty
 
-                Just ( msg, remainingMailbox ) ->
-                    let
-                        entryWithDrained =
-                            ProcessEntry { r | mailbox = remainingMailbox }
+        preservedEntry =
+            ProcessEntry { updatedRecord | mailbox = currentMailbox }
 
-                        systemWithDrained =
-                            { system | processes = Dict.insert pid entryWithDrained system.processes }
+        systemWithUpdated =
+            { newSystem | processes = Dict.insert pid preservedEntry newSystem.processes }
 
-                        ( ProcessEntry updatedRecord, newSystem, cmd ) =
-                            r.handleMessage msg systemWithDrained
+        ( finalSystem, moreCmds ) =
+            drainMailbox pid systemWithUpdated
+    in
+    ( finalSystem, Cmd.batch [ moreCmds, cmd ] )
 
-                        -- handleWith returns a new entry with Mailbox.empty, which would
-                        -- wipe remaining messages. Preserve the current mailbox from the
-                        -- system (which may also have new messages added during handling).
-                        currentMailbox =
-                            case Dict.get pid newSystem.processes of
-                                Just (ProcessEntry currentR) ->
-                                    currentR.mailbox
 
-                                Nothing ->
-                                    Mailbox.empty
+findFirstMatch : List (SelectorEntry appMsg) -> List (MailboxEntry appMsg) -> List (MailboxEntry appMsg) -> Maybe ( appMsg, List (MailboxEntry appMsg) )
+findFirstMatch selectors remaining skipped =
+    case remaining of
+        [] ->
+            Nothing
 
-                        preservedEntry =
-                            ProcessEntry { updatedRecord | mailbox = currentMailbox }
+        entry :: rest ->
+            case tryMatchSelectors selectors entry of
+                Just transformedMsg ->
+                    Just ( transformedMsg, List.reverse skipped ++ rest )
 
-                        systemWithUpdated =
-                            { newSystem | processes = Dict.insert pid preservedEntry newSystem.processes }
+                Nothing ->
+                    findFirstMatch selectors rest (entry :: skipped)
 
-                        ( finalSystem, moreCmds ) =
-                            drainMailbox pid systemWithUpdated
-                    in
-                    ( finalSystem, Cmd.batch [ moreCmds, cmd ] )
+
+tryMatchSelectors : List (SelectorEntry appMsg) -> MailboxEntry appMsg -> Maybe appMsg
+tryMatchSelectors selectors entry =
+    case selectors of
+        [] ->
+            Nothing
+
+        sel :: rest ->
+            case Selector.matchSelector sel.ast entry.message entry.sourceSubject of
+                Just result ->
+                    Just result
+
+                Nothing ->
+                    tryMatchSelectors rest entry
+
+
+getSelectorsForProcess : ProcessId -> ActorSystem appMsg -> List (SelectorEntry appMsg)
+getSelectorsForProcess pid system =
+    system.selectors
+        |> Dict.values
+        |> List.filter (\sel -> sel.owner == pid)
+
+
+{-| Deliver a single message directly to an actor's handleMessage.
+Used for routing actor subscription events back to the owning process.
+-}
+deliverToActor : ProcessId -> appMsg -> ActorSystem appMsg -> ( ActorSystem appMsg, Cmd appMsg )
+deliverToActor pid appMsg system =
+    case Dict.get pid system.processes of
+        Nothing ->
+            ( system, Cmd.none )
+
+        Just (ProcessEntry r) ->
+            let
+                ( ProcessEntry updatedRecord, newSystem, cmd ) =
+                    r.handleMessage appMsg system
+
+                currentMailbox =
+                    case Dict.get pid newSystem.processes of
+                        Just (ProcessEntry currentR) ->
+                            currentR.mailbox
+
+                        Nothing ->
+                            Mailbox.empty
+
+                preservedEntry =
+                    ProcessEntry { updatedRecord | mailbox = currentMailbox }
+            in
+            ( { newSystem | processes = Dict.insert pid preservedEntry newSystem.processes }
+            , cmd
+            )
+
+
+{-| Collect all actor subscriptions and map them to the main msg type.
+The routeMsg function receives the process ID and appMsg, and should
+produce a msg that delivers the appMsg to that process (e.g. via RunSystemOp).
+-}
+collectActorSubs : (ProcessId -> appMsg -> msg) -> ActorSystem appMsg -> Sub msg
+collectActorSubs routeMsg system =
+    system.processes
+        |> Dict.toList
+        |> List.map (\( pid, ProcessEntry r ) -> Sub.map (routeMsg pid) r.actorSubs)
+        |> Sub.batch
+
+
+{-| Deliver a message directly to a process via its opaque handle.
+-}
+deliver : Process appMsg -> appMsg -> ActorSystem appMsg -> ( ActorSystem appMsg, Cmd appMsg )
+deliver (Process pid) appMsg system =
+    deliverToActor pid appMsg system
+
+
+{-| Collect all actor subscriptions, using opaque Process handles in the callback.
+-}
+collectSubscriptions : (Process appMsg -> appMsg -> msg) -> ActorSystem appMsg -> Sub msg
+collectSubscriptions routeMsg system =
+    collectActorSubs (\pid -> routeMsg (Process pid)) system
 
 
 updateTime : Time.Posix -> ActorSystem appMsg -> ActorSystem appMsg
 updateTime time system =
     { system | currentTime = time }
+
+
+{-| Store a message for port-bounce delivery and return its ID.
+-}
+storeMessage : SubjectId -> appMsg -> ActorSystem appMsg -> ( ActorSystem appMsg, Int )
+storeMessage sid msg system =
+    let
+        mid =
+            system.nextMessageId
+
+        entry =
+            { subjectId = sid, message = msg }
+    in
+    ( { system
+        | nextMessageId = mid + 1
+        , messageStore = Dict.insert mid entry system.messageStore
+      }
+    , mid
+    )
+
+
+{-| Look up a stored message by ID.
+-}
+lookupMessage : Int -> ActorSystem appMsg -> Maybe (MessageStoreEntry appMsg)
+lookupMessage mid system =
+    Dict.get mid system.messageStore
+
+
+{-| Get all message store entries as a list.
+-}
+messageStoreValues : ActorSystem appMsg -> List (MessageStoreEntry appMsg)
+messageStoreValues system =
+    Dict.values system.messageStore
 
 
 getProcess : ProcessId -> ActorSystem appMsg -> Maybe (ProcessEntry appMsg)
