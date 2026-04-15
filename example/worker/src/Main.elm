@@ -1,20 +1,19 @@
 port module Main exposing (main)
 
-{-| Example worker demonstrating the actor system with P2P messaging and pub/sub,
+{-| Example worker demonstrating the actor system with Channel messaging,
 using elm-procedure for async composition.
 
-A supervisor actor spawns a worker actor, sends it jobs via P2P subjects,
-and the worker reports back. A pub/sub topic broadcasts system events.
+A supervisor actor spawns a worker actor, sends it jobs via a OneToOne channel,
+and the worker reports back. A Broadcast channel broadcasts system events.
 
-Each actor creates its own Selector on its Subject and subscribes to it.
+Each actor creates its own Selector on its Channel and subscribes to it.
 The runtime collects actor subscriptions and routes matching messages back
 to the owning actor.
 -}
 
+import Actor.Channel as Channel
 import Actor.Core as Core
 import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext)
-import Actor.P2P as P2P exposing (Subject)
-import Actor.PubSub as PubSub
 import Platform
 import Procedure
 import Procedure.Program
@@ -41,7 +40,7 @@ port exitPort : () -> Cmd msg
 type alias Model =
     { system : ActorSystem AppMsg
     , procModel : Procedure.Program.Model Msg
-    , eventsTopic : Maybe (PubSub.Topic AppMsg AppMsg)
+    , eventsTopic : Maybe (Channel.Channel AppMsg Channel.Broadcast AppMsg)
     }
 
 
@@ -53,7 +52,7 @@ type Msg
     = ProcMsg (Procedure.Program.Msg Msg)
     | RunSystemOp (ActorSystem AppMsg -> ( ActorSystem AppMsg, Cmd Msg ))
     | DeliverToActor (Core.Process AppMsg) AppMsg
-    | SetEventsTopic (PubSub.Topic AppMsg AppMsg)
+    | SetEventsTopic (Channel.Channel AppMsg Channel.Broadcast AppMsg)
     | BroadcastEvent AppMsg
     | InitDone
     | Tick Time.Posix
@@ -80,18 +79,18 @@ log message =
     Procedure.do (logPort message)
 
 
-createSubject : Procedure.Procedure Never (Subject AppMsg AppMsg) Msg
-createSubject =
-    P2P.subject ctx identity Just
+createOneToOne : Procedure.Procedure Never (Channel.Channel AppMsg Channel.OneToOne AppMsg) Msg
+createOneToOne =
+    Channel.oneToOne ctx identity Just
 
 
 
 -- INIT PROCEDURES
 
 
-spawnSupervisor : Procedure.Procedure Never (Subject AppMsg AppMsg) Msg
+spawnSupervisor : Procedure.Procedure Never (Channel.Channel AppMsg Channel.OneToOne AppMsg) Msg
 spawnSupervisor =
-    createSubject
+    createOneToOne
         |> Procedure.andThen
             (\reportInbox ->
                 Core.spawn ctx (Supervisor.actor logPort) reportInbox
@@ -100,9 +99,9 @@ spawnSupervisor =
             )
 
 
-spawnWorker : Subject AppMsg AppMsg -> Procedure.Procedure Never ( Subject AppMsg AppMsg, Subject AppMsg AppMsg ) Msg
+spawnWorker : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Procedure.Procedure Never ( Channel.Channel AppMsg Channel.OneToOne AppMsg, Channel.Channel AppMsg Channel.OneToOne AppMsg ) Msg
 spawnWorker reportInbox =
-    createSubject
+    createOneToOne
         |> Procedure.andThen
             (\workerInbox ->
                 Core.spawn ctx (Worker.actor logPort) workerInbox
@@ -111,36 +110,36 @@ spawnWorker reportInbox =
             )
 
 
-setupPubSub : Procedure.Procedure Never (PubSub.Topic AppMsg AppMsg) Msg
-setupPubSub =
-    PubSub.topic ctx identity Just
+setupBroadcast : Procedure.Procedure Never (Channel.Channel AppMsg Channel.Broadcast AppMsg) Msg
+setupBroadcast =
+    Channel.broadcast ctx identity Just
         |> Procedure.andThen
             (\topic ->
-                log "Events pub/sub topic created"
+                log "Events broadcast channel created"
                     |> Procedure.andThen (\() -> Procedure.do (Runtime.msgToCmd (SetEventsTopic topic)))
                     |> Procedure.map (\() -> topic)
             )
 
 
-publishEvents : PubSub.Topic AppMsg AppMsg -> Procedure.Procedure Never () Msg
+publishEvents : Channel.Channel AppMsg Channel.Broadcast AppMsg -> Procedure.Procedure Never () Msg
 publishEvents topic =
-    PubSub.publish ctx topic (TopicEvent "system-started")
-        |> Procedure.andThen (\() -> PubSub.publish ctx topic (TopicEvent "supervisor-ready"))
-        |> Procedure.andThen (\() -> PubSub.publish ctx topic (TopicEvent "worker-spawned"))
-        |> Procedure.andThen (\() -> log "Published 3 events to pub/sub topic")
+    Channel.publish ctx topic (TopicEvent "system-started")
+        |> Procedure.andThen (\() -> Channel.publish ctx topic (TopicEvent "supervisor-ready"))
+        |> Procedure.andThen (\() -> Channel.publish ctx topic (TopicEvent "worker-spawned"))
+        |> Procedure.andThen (\() -> log "Published 3 events to broadcast channel")
 
 
-sendJobs : Subject AppMsg AppMsg -> Procedure.Procedure Never () Msg
+sendJobs : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Procedure.Procedure Never () Msg
 sendJobs workerInbox =
-    P2P.send ctx workerInbox (WorkerJob 1)
-        |> Procedure.andThen (\() -> P2P.send ctx workerInbox (WorkerJob 2))
-        |> Procedure.andThen (\() -> P2P.send ctx workerInbox (WorkerJob 3))
+    Channel.send ctx workerInbox (WorkerJob 1)
+        |> Procedure.andThen (\() -> Channel.send ctx workerInbox (WorkerJob 2))
+        |> Procedure.andThen (\() -> Channel.send ctx workerInbox (WorkerJob 3))
         |> Procedure.andThen (\() -> log "Sent 3 jobs to worker")
 
 
-sendReport : Subject AppMsg AppMsg -> Procedure.Procedure Never () Msg
+sendReport : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Procedure.Procedure Never () Msg
 sendReport reportInbox =
-    P2P.send ctx reportInbox (WorkerReport "Jobs queued")
+    Channel.send ctx reportInbox (WorkerReport "Jobs queued")
 
 
 initProcedure : Procedure.Procedure Never () Msg
@@ -150,7 +149,7 @@ initProcedure =
         |> Procedure.andThen spawnWorker
         |> Procedure.andThen
             (\( reportInbox, workerInbox ) ->
-                setupPubSub
+                setupBroadcast
                     |> Procedure.andThen publishEvents
                     |> Procedure.andThen (\() -> sendJobs workerInbox)
                     |> Procedure.andThen (\() -> sendReport reportInbox)
@@ -239,10 +238,10 @@ update msg model =
 subscriptions : Model -> Sub Msg
 subscriptions model =
     let
-        pubsubSub =
+        broadcastSub =
             case model.eventsTopic of
                 Just topic ->
-                    PubSub.subscribe model.system topic
+                    Channel.subscribe model.system (Channel.all topic)
                         |> Sub.map
                             (\maybe ->
                                 case maybe of
@@ -260,5 +259,5 @@ subscriptions model =
         [ Procedure.Program.subscriptions model.procModel
         , Time.every 1000 Tick
         , Runtime.collectSubscriptions DeliverToActor NoOp model.system
-        , pubsubSub
+        , broadcastSub
         ]

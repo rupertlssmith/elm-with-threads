@@ -1,8 +1,12 @@
-module Actor.P2P exposing
-    ( Subject
+module Actor.Channel exposing
+    ( Channel
+    , OneToOne
+    , Broadcast
     , Selector
-    , subject
+    , oneToOne
+    , broadcast
     , send
+    , publish
     , all
     , selector
     , selectMap
@@ -14,7 +18,13 @@ module Actor.P2P exposing
     , subscribe
     )
 
-{-| Point-to-point messaging between actors via subjects and selectors.
+{-| Unified channel for both point-to-point and broadcast messaging.
+
+Channels create a subject ID, store messages, and use port-bounce for delivery.
+The phantom type parameter `c` distinguishes delivery semantics:
+
+  - `OneToOne` — point-to-point messaging (one consumer)
+  - `Broadcast` — pub/sub messaging (all consumers)
 
 Send operations use elm-procedure for async composition.
 Subscribe returns a real Elm Sub via port-bounce: each send fires a port
@@ -23,11 +33,11 @@ notification, JS echoes it back, and the subscribe Sub picks it up.
 Selectors have two type parameters: `msg` is the input message type,
 `a` is the output type after transformation.
 
-Subjects carry a codec for encoding/decoding between the payload type `a`
+Channels carry a codec for encoding/decoding between the payload type `a`
 and the system message type `msg`.
 
-@docs Subject, Selector
-@docs subject, send
+@docs Channel, OneToOne, Broadcast, Selector
+@docs oneToOne, broadcast, send, publish
 @docs all, selector, selectMap, map, filter, orElse, withTimeout
 @docs select, subscribe
 
@@ -39,14 +49,26 @@ import Actor.Ports
 import Procedure
 
 
-{-| A subject is a named mailbox owned by a process. Other actors send messages
-to a subject; the owning process receives them.
+{-| Phantom type for point-to-point channels.
+-}
+type OneToOne
+    = OneToOne
+
+
+{-| Phantom type for broadcast channels.
+-}
+type Broadcast
+    = Broadcast
+
+
+{-| A channel is a named mailbox. The phantom type `c` distinguishes
+point-to-point (`OneToOne`) from broadcast (`Broadcast`) semantics.
 
 `msg` is the system message type, `a` is the payload type.
-The subject carries an encoder `(a -> msg)` and decoder `(msg -> Maybe a)`.
+The channel carries an encoder `(a -> msg)` and decoder `(msg -> Maybe a)`.
 -}
-type Subject msg a
-    = Subject SubjectId (a -> msg) (msg -> Maybe a)
+type Channel msg c a
+    = Channel SubjectId (a -> msg) (msg -> Maybe a)
 
 
 {-| A selector matches incoming messages and transforms them.
@@ -56,10 +78,10 @@ type Selector msg a
     = Selector (msg -> SubjectId -> Maybe a)
 
 
-{-| Create a new subject with an encoder/decoder codec.
+{-| Create a new point-to-point channel with an encoder/decoder codec.
 -}
-subject : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Subject msg a) parentMsg
-subject ctx encode decode =
+oneToOne : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Channel msg OneToOne a) parentMsg
+oneToOne ctx encode decode =
     Procedure.fetch
         (\tagger ->
             let
@@ -68,18 +90,36 @@ subject ctx encode decode =
                         ( newSystem, sid ) =
                             Runtime.createSubject system
                     in
-                    ( newSystem, msgToCmd (tagger (Subject sid encode decode)) )
+                    ( newSystem, msgToCmd (tagger (Channel sid encode decode)) )
             in
             msgToCmd (ctx.runOp op)
         )
 
 
-{-| Send a message to a subject. Encodes the payload, stores it in the
-message store, and fires a port notification. Subscribers are woken via
+{-| Create a new broadcast channel with an encoder/decoder codec.
+-}
+broadcast : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Channel msg Broadcast a) parentMsg
+broadcast ctx encode decode =
+    Procedure.fetch
+        (\tagger ->
+            let
+                op system =
+                    let
+                        ( newSystem, sid ) =
+                            Runtime.createSubject system
+                    in
+                    ( newSystem, msgToCmd (tagger (Channel sid encode decode)) )
+            in
+            msgToCmd (ctx.runOp op)
+        )
+
+
+{-| Send a message to a point-to-point channel. Encodes the payload, stores it
+in the message store, and fires a port notification. Subscribers are woken via
 the port-bounce echo.
 -}
-send : SystemContext msg parentMsg -> Subject msg a -> a -> Procedure.Procedure Never () parentMsg
-send ctx (Subject sid encode _) value =
+send : SystemContext msg parentMsg -> Channel msg OneToOne a -> a -> Procedure.Procedure Never () parentMsg
+send ctx (Channel sid encode _) value =
     Procedure.fetch
         (\tagger ->
             let
@@ -100,11 +140,37 @@ send ctx (Subject sid encode _) value =
         )
 
 
-{-| Create a selector that accepts messages from a specific subject.
-Uses the subject's decoder to extract the payload.
+{-| Publish a message to a broadcast channel. Encodes the payload, stores it
+in the message store, and fires a port notification. All subscribers receive
+the message via port-bounce.
 -}
-all : Subject msg a -> Selector msg a
-all (Subject sid _ decode) =
+publish : SystemContext msg parentMsg -> Channel msg Broadcast a -> a -> Procedure.Procedure Never () parentMsg
+publish ctx (Channel sid encode _) value =
+    Procedure.fetch
+        (\tagger ->
+            let
+                op system =
+                    let
+                        ( newSystem, messageId ) =
+                            Runtime.storeMessage sid (encode value) system
+                    in
+                    ( newSystem
+                    , Cmd.batch
+                        [ Actor.Ports.notifyP2PSend
+                            { subjectId = sid, messageId = messageId }
+                        , msgToCmd (tagger ())
+                        ]
+                    )
+            in
+            msgToCmd (ctx.runOp op)
+        )
+
+
+{-| Create a selector that accepts messages from a specific channel.
+Uses the channel's decoder to extract the payload.
+-}
+all : Channel msg c a -> Selector msg a
+all (Channel sid _ decode) =
     Selector
         (\sysMsg sourceSubject ->
             if sourceSubject == sid then
@@ -122,12 +188,12 @@ selector =
     Selector (\msg _ -> Just msg)
 
 
-{-| Add a subject source to a selector with a transformation function.
-Decodes the payload from the subject, applies the transform, and feeds
+{-| Add a channel source to a selector with a transformation function.
+Decodes the payload from the channel, applies the transform, and feeds
 the result through the inner selector.
 -}
-selectMap : Subject msg a -> (a -> msg) -> Selector msg b -> Selector msg b
-selectMap (Subject sid _ decode) transform (Selector sel) =
+selectMap : Channel msg c a -> (a -> msg) -> Selector msg b -> Selector msg b
+selectMap (Channel sid _ decode) transform (Selector sel) =
     Selector
         (\incomingMsg sourceSubject ->
             if sourceSubject == sid then
