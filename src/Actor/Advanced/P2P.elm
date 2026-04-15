@@ -6,9 +6,7 @@ module Actor.Advanced.P2P exposing
     , Envelope
     , subject
     , send
-    , sendKeyed
     , resendAsPossibleDuplicate
-    , sendWithPartitionKey
     , all
     , selector
     , selectMap
@@ -34,7 +32,7 @@ Subjects carry a codec for encoding/decoding between the payload type `a`
 and the system message type `msg`.
 
 @docs Subject, Selector, Key, Meta, Envelope
-@docs subject, send, sendKeyed, resendAsPossibleDuplicate, sendWithPartitionKey
+@docs subject, send, resendAsPossibleDuplicate
 @docs all, selector, selectMap, map, filter, orElse, withTimeout
 @docs select, selectWithMeta, subscribe, subscribeWithMeta
 
@@ -125,25 +123,10 @@ send ctx (Subject sid encode _) value =
         )
 
 
-{-| Send a keyed message to an advanced subject.
--}
-sendKeyed : SystemContext msg parentMsg -> Subject msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
-sendKeyed ctx subj _ a =
-    send ctx subj a
-
-
 {-| Resend a message marked as a possible duplicate.
 -}
 resendAsPossibleDuplicate : SystemContext msg parentMsg -> Subject msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
 resendAsPossibleDuplicate ctx subj _ a =
-    send ctx subj a
-
-
-{-| Send using a function that derives a partition key from the payload.
-In this simulation, the key is ignored (no real partitioning).
--}
-sendWithPartitionKey : SystemContext msg parentMsg -> (a -> Key) -> Subject msg a -> a -> Procedure.Procedure Never () parentMsg
-sendWithPartitionKey ctx _ subj a =
     send ctx subj a
 
 

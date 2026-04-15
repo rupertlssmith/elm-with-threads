@@ -1,14 +1,11 @@
 module Actor.P2P exposing (..)
 
-type alias Key = String
-
 type Subject a = Subject
 
 type Selector msg a = Selector
 
 subject : Task x (Subject a)
 send : Subject a -> a -> Task x ()
-sendKeyed : Subject a -> Key -> a -> Task x ()
 all : Subject a -> Selector a a
 selector : Selector msg msg
 selectMap : Subject a -> (a -> msg) -> Selector msg b -> Selector msg b

@@ -27,7 +27,6 @@ module Actor.Internal.Runtime exposing
     , seekConsumerToBeginning
     , seekConsumerToEnd
     , seekConsumerToOffset
-    , sendKeyedToSubject
     , sendToSubject
     , spawnProcess
     , storeMessage
@@ -193,11 +192,6 @@ sendToSubject sid msg system =
 
         Just subjectEntry ->
             enqueueToProcess subjectEntry.owner sid msg system
-
-
-sendKeyedToSubject : SubjectId -> Key -> appMsg -> ActorSystem appMsg -> ActorSystem appMsg
-sendKeyedToSubject sid _ msg system =
-    sendToSubject sid msg system
 
 
 enqueueToProcess : ProcessId -> SubjectId -> appMsg -> ActorSystem appMsg -> ActorSystem appMsg

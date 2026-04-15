@@ -19,9 +19,7 @@ type alias Envelope a =
 
 subject : Task x (Subject a)
 send : Subject a -> a -> Task x ()
-sendKeyed : Subject a -> Key -> a -> Task x ()
 resendAsPossibleDuplicate : Subject a -> Key -> a -> Task x ()
-sendWithPartitionKey : (a -> Key) -> Subject a -> a -> Task x ()
 all : Subject a -> Selector a a
 selector : Selector msg msg
 selectMap : Subject a -> (a -> msg) -> Selector msg b -> Selector msg b

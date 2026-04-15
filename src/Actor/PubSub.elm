@@ -1,9 +1,7 @@
 module Actor.PubSub exposing
     ( Topic
-    , Key
     , topic
     , publish
-    , publishKeyed
     , subscribe
     )
 
@@ -17,8 +15,8 @@ Subscribe returns a real Elm Sub via port-bounce.
 Topics carry a codec for encoding/decoding between the payload type `a`
 and the system message type `msg`.
 
-@docs Topic, Key
-@docs topic, publish, publishKeyed, subscribe
+@docs Topic
+@docs topic, publish, subscribe
 
 -}
 
@@ -34,10 +32,6 @@ import Procedure
 -}
 type Topic msg a
     = Topic SubjectId (a -> msg) (msg -> Maybe a)
-
-
-type alias Key =
-    String
 
 
 {-| Create a new pub/sub topic with an encoder/decoder codec.
@@ -81,14 +75,6 @@ publish ctx (Topic sid encode _) value =
             in
             msgToCmd (ctx.runOp op)
         )
-
-
-{-| Publish a keyed message to a pub/sub topic.
-The key is ignored in this simulation (no partitioning).
--}
-publishKeyed : SystemContext msg parentMsg -> Topic msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
-publishKeyed ctx tp _ a =
-    publish ctx tp a
 
 
 {-| Subscribe to all messages on a pub/sub topic.

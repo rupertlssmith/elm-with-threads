@@ -1,10 +1,8 @@
 module Actor.P2P exposing
     ( Subject
     , Selector
-    , Key
     , subject
     , send
-    , sendKeyed
     , all
     , selector
     , selectMap
@@ -28,8 +26,8 @@ Selectors have two type parameters: `msg` is the input message type,
 Subjects carry a codec for encoding/decoding between the payload type `a`
 and the system message type `msg`.
 
-@docs Subject, Selector, Key
-@docs subject, send, sendKeyed
+@docs Subject, Selector
+@docs subject, send
 @docs all, selector, selectMap, map, filter, orElse, withTimeout
 @docs select, subscribe
 
@@ -56,12 +54,6 @@ type Subject msg a
 -}
 type Selector msg a
     = Selector (msg -> SubjectId -> Maybe a)
-
-
-{-| A routing key for keyed sends.
--}
-type alias Key =
-    String
 
 
 {-| Create a new subject with an encoder/decoder codec.
@@ -106,13 +98,6 @@ send ctx (Subject sid encode _) value =
             in
             msgToCmd (ctx.runOp op)
         )
-
-
-{-| Send a keyed message to a subject.
--}
-sendKeyed : SystemContext msg parentMsg -> Subject msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
-sendKeyed ctx subj _ a =
-    send ctx subj a
 
 
 {-| Create a selector that accepts messages from a specific subject.
