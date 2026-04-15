@@ -92,7 +92,7 @@ type alias ProcessEntryRecord appMsg =
     { id : ProcessId
     , mailbox : Mailbox (MailboxEntry appMsg)
     , handleMessage : appMsg -> ActorSystem appMsg -> ( ProcessEntry appMsg, ActorSystem appMsg, Cmd appMsg )
-    , actorSubs : Sub appMsg
+    , actorSubs : ActorSystem appMsg -> Sub (Maybe appMsg)
     }
 
 
@@ -525,12 +525,25 @@ deliverToActor pid appMsg system =
 {-| Collect all actor subscriptions and map them to the main msg type.
 The routeMsg function receives the process ID and appMsg, and should
 produce a msg that delivers the appMsg to that process (e.g. via RunSystemOp).
+The noOp msg is used when a subscription produces Nothing (no match).
 -}
-collectActorSubs : (ProcessId -> appMsg -> msg) -> ActorSystem appMsg -> Sub msg
-collectActorSubs routeMsg system =
+collectActorSubs : (ProcessId -> appMsg -> msg) -> msg -> ActorSystem appMsg -> Sub msg
+collectActorSubs routeMsg noOp system =
     system.processes
         |> Dict.toList
-        |> List.map (\( pid, ProcessEntry r ) -> Sub.map (routeMsg pid) r.actorSubs)
+        |> List.map
+            (\( pid, ProcessEntry r ) ->
+                r.actorSubs system
+                    |> Sub.map
+                        (\maybeMsg ->
+                            case maybeMsg of
+                                Just appMsg ->
+                                    routeMsg pid appMsg
+
+                                Nothing ->
+                                    noOp
+                        )
+            )
         |> Sub.batch
 
 
@@ -543,9 +556,9 @@ deliver (Process pid) appMsg system =
 
 {-| Collect all actor subscriptions, using opaque Process handles in the callback.
 -}
-collectSubscriptions : (Process appMsg -> appMsg -> msg) -> ActorSystem appMsg -> Sub msg
-collectSubscriptions routeMsg system =
-    collectActorSubs (\pid -> routeMsg (Process pid)) system
+collectSubscriptions : (Process appMsg -> appMsg -> msg) -> msg -> ActorSystem appMsg -> Sub msg
+collectSubscriptions routeMsg noOp system =
+    collectActorSubs (\pid -> routeMsg (Process pid)) noOp system
 
 
 updateTime : Time.Posix -> ActorSystem appMsg -> ActorSystem appMsg

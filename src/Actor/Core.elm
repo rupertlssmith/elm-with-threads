@@ -20,11 +20,16 @@ import Procedure
 
 
 {-| Definition of an actor with flags, model and message type.
+
+In the real platform, subscriptions would be `model -> Sub msg` and the
+platform provides the system context implicitly. In this simulation,
+the ActorSystem is passed explicitly, and Sub returns Maybe to handle
+port-bounce events that don't match the actor's selector.
 -}
 type alias Actor flags model msg =
     { init : flags -> ( model, Cmd msg )
     , update : msg -> model -> ( model, Cmd msg )
-    , subscriptions : model -> Sub msg
+    , subscriptions : ActorSystem msg -> model -> Sub (Maybe msg)
     }
 
 
@@ -52,7 +57,7 @@ spawn ctx actor flags =
                                 { id = pid
                                 , mailbox = Mailbox.empty
                                 , handleMessage = handleWith actor initialModel pid
-                                , actorSubs = actor.subscriptions initialModel
+                                , actorSubs = \sys -> actor.subscriptions sys initialModel
                                 }
 
                         ( newSystem, spawnedPid ) =
@@ -115,7 +120,7 @@ handleWith actor model pid msg system =
                 { id = pid
                 , mailbox = Mailbox.empty
                 , handleMessage = handleWith actor newModel pid
-                , actorSubs = actor.subscriptions newModel
+                , actorSubs = \sys -> actor.subscriptions sys newModel
                 }
     in
     ( newEntry, system, cmd )

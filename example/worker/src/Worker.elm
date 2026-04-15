@@ -1,13 +1,15 @@
 module Worker exposing (Model, actor)
 
 import Actor.Core exposing (Actor)
-import Actor.P2P exposing (Subject)
+import Actor.Internal.Runtime exposing (ActorSystem)
+import Actor.P2P as P2P exposing (Subject)
 import Time
 import Types exposing (AppMsg(..))
 
 
 type alias Model =
     { inbox : Subject AppMsg AppMsg
+    , selector : P2P.Selector AppMsg AppMsg
     , jobCount : Int
     }
 
@@ -22,7 +24,12 @@ actor log =
 
 init : Subject AppMsg AppMsg -> ( Model, Cmd AppMsg )
 init inbox =
-    ( { inbox = inbox, jobCount = 0 }, Cmd.none )
+    ( { inbox = inbox
+      , selector = P2P.all inbox
+      , jobCount = 0
+      }
+    , Cmd.none
+    )
 
 
 update : (String -> Cmd AppMsg) -> AppMsg -> Model -> ( Model, Cmd AppMsg )
@@ -46,6 +53,9 @@ update log msg model =
             ( model, Cmd.none )
 
 
-subscriptions : Model -> Sub AppMsg
-subscriptions _ =
-    Time.every 2000 Heartbeat
+subscriptions : ActorSystem AppMsg -> Model -> Sub (Maybe AppMsg)
+subscriptions system model =
+    Sub.batch
+        [ P2P.subscribe system model.selector
+        , Time.every 2000 Heartbeat |> Sub.map Just
+        ]

@@ -1,12 +1,15 @@
 module Supervisor exposing (actor)
 
 import Actor.Core exposing (Actor)
-import Actor.P2P exposing (Subject)
+import Actor.Internal.Runtime exposing (ActorSystem)
+import Actor.P2P as P2P exposing (Subject)
 import Types exposing (AppMsg(..))
 
 
 type alias Model =
-    Subject AppMsg AppMsg
+    { inbox : Subject AppMsg AppMsg
+    , selector : P2P.Selector AppMsg AppMsg
+    }
 
 
 actor : (String -> Cmd AppMsg) -> Actor (Subject AppMsg AppMsg) Model AppMsg
@@ -19,7 +22,11 @@ actor log =
 
 init : Subject AppMsg AppMsg -> ( Model, Cmd AppMsg )
 init inbox =
-    ( inbox, Cmd.none )
+    ( { inbox = inbox
+      , selector = P2P.all inbox
+      }
+    , Cmd.none
+    )
 
 
 update : (String -> Cmd AppMsg) -> AppMsg -> Model -> ( Model, Cmd AppMsg )
@@ -32,6 +39,6 @@ update log msg model =
             ( model, Cmd.none )
 
 
-subscriptions : Model -> Sub AppMsg
-subscriptions _ =
-    Sub.none
+subscriptions : ActorSystem AppMsg -> Model -> Sub (Maybe AppMsg)
+subscriptions system model =
+    P2P.subscribe system model.selector

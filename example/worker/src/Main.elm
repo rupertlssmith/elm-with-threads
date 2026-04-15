@@ -6,11 +6,12 @@ using elm-procedure for async composition.
 A supervisor actor spawns a worker actor, sends it jobs via P2P subjects,
 and the worker reports back. A pub/sub topic broadcasts system events.
 
-Subscribe uses real Elm Sub via port-bounce: each send fires a port notification,
-JS echoes it back, and the subscribe Sub picks up matching messages.
+Each actor creates its own Selector on its Subject and subscribes to it.
+The runtime collects actor subscriptions and routes matching messages back
+to the owning actor.
 -}
 
-import Actor.Core as Core exposing (Process)
+import Actor.Core as Core
 import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext)
 import Actor.P2P as P2P exposing (Subject)
 import Actor.PubSub as PubSub
@@ -37,16 +38,9 @@ port exitPort : () -> Cmd msg
 -- MODEL
 
 
-type alias Route =
-    { process : Process AppMsg
-    , selector : P2P.Selector AppMsg AppMsg
-    }
-
-
 type alias Model =
     { system : ActorSystem AppMsg
     , procModel : Procedure.Program.Model Msg
-    , routes : List Route
     , eventsTopic : Maybe (PubSub.Topic AppMsg AppMsg)
     }
 
@@ -58,8 +52,7 @@ type alias Model =
 type Msg
     = ProcMsg (Procedure.Program.Msg Msg)
     | RunSystemOp (ActorSystem AppMsg -> ( ActorSystem AppMsg, Cmd Msg ))
-    | RouteToActor (Process AppMsg) AppMsg
-    | RegisterRoute (Process AppMsg) (P2P.Selector AppMsg AppMsg)
+    | DeliverToActor (Core.Process AppMsg) AppMsg
     | SetEventsTopic (PubSub.Topic AppMsg AppMsg)
     | BroadcastEvent AppMsg
     | InitDone
@@ -87,11 +80,6 @@ log message =
     Procedure.do (logPort message)
 
 
-registerRoute : Process AppMsg -> P2P.Selector AppMsg AppMsg -> Procedure.Procedure Never () Msg
-registerRoute process sel =
-    Procedure.do (Runtime.msgToCmd (RegisterRoute process sel))
-
-
 createSubject : Procedure.Procedure Never (Subject AppMsg AppMsg) Msg
 createSubject =
     P2P.subject ctx identity Just
@@ -107,8 +95,7 @@ spawnSupervisor =
         |> Procedure.andThen
             (\reportInbox ->
                 Core.spawn ctx (Supervisor.actor logPort) reportInbox
-                    |> Procedure.andThen (\process -> registerRoute process (P2P.all reportInbox))
-                    |> Procedure.andThen (\() -> log "Supervisor spawned")
+                    |> Procedure.andThen (\_ -> log "Supervisor spawned")
                     |> Procedure.map (\() -> reportInbox)
             )
 
@@ -119,8 +106,7 @@ spawnWorker reportInbox =
         |> Procedure.andThen
             (\workerInbox ->
                 Core.spawn ctx (Worker.actor logPort) workerInbox
-                    |> Procedure.andThen (\process -> registerRoute process (P2P.all workerInbox))
-                    |> Procedure.andThen (\() -> log "Worker spawned")
+                    |> Procedure.andThen (\_ -> log "Worker spawned")
                     |> Procedure.map (\() -> ( reportInbox, workerInbox ))
             )
 
@@ -190,7 +176,6 @@ init : () -> ( Model, Cmd Msg )
 init _ =
     ( { system = Runtime.initSystem
       , procModel = Procedure.Program.init
-      , routes = []
       , eventsTopic = Nothing
       }
     , Procedure.run ProcMsg (\() -> InitDone) initProcedure
@@ -215,17 +200,12 @@ update msg model =
             in
             ( { model | system = newSystem }, cmd )
 
-        RouteToActor process appMsg ->
+        DeliverToActor process appMsg ->
             let
                 ( newSystem, actorCmd ) =
                     Runtime.deliver process appMsg model.system
             in
             ( { model | system = newSystem }, Cmd.map (\_ -> NoOp) actorCmd )
-
-        RegisterRoute process sel ->
-            ( { model | routes = { process = process, selector = sel } :: model.routes }
-            , Cmd.none
-            )
 
         SetEventsTopic topic ->
             ( { model | eventsTopic = Just topic }
@@ -259,22 +239,6 @@ update msg model =
 subscriptions : Model -> Sub Msg
 subscriptions model =
     let
-        p2pSubs =
-            model.routes
-                |> List.map
-                    (\route ->
-                        P2P.subscribe model.system route.selector
-                            |> Sub.map
-                                (\maybe ->
-                                    case maybe of
-                                        Just appMsg ->
-                                            RouteToActor route.process appMsg
-
-                                        Nothing ->
-                                            NoOp
-                                )
-                    )
-
         pubsubSub =
             case model.eventsTopic of
                 Just topic ->
@@ -293,10 +257,8 @@ subscriptions model =
                     Sub.none
     in
     Sub.batch
-        ([ Procedure.Program.subscriptions model.procModel
-         , Time.every 1000 Tick
-         , Runtime.collectSubscriptions RouteToActor model.system
-         , pubsubSub
-         ]
-            ++ p2pSubs
-        )
+        [ Procedure.Program.subscriptions model.procModel
+        , Time.every 1000 Tick
+        , Runtime.collectSubscriptions DeliverToActor NoOp model.system
+        , pubsubSub
+        ]
