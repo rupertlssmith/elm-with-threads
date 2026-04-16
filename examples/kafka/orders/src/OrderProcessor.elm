@@ -14,13 +14,13 @@ import Types exposing (AppMsg(..), Order)
 
 
 type alias Model =
-    { consumer : Topic.Consumer Order
-    , selector : Topic.Selector (Topic.ConsumerRecord Order) (Topic.ConsumerRecord Order)
+    { consumer : Topic.Consumer AppMsg Order
+    , selector : Topic.Selector AppMsg (Topic.ConsumerRecord Order)
     , processed : Int
     }
 
 
-actor : (String -> Cmd AppMsg) -> Actor (Topic.Consumer Order) Model AppMsg
+actor : (String -> Cmd AppMsg) -> Actor (Topic.Consumer AppMsg Order) Model AppMsg
 actor log =
     { init = init
     , update = update log
@@ -28,7 +28,7 @@ actor log =
     }
 
 
-init : Topic.Consumer Order -> ( Model, Cmd AppMsg )
+init : Topic.Consumer AppMsg Order -> ( Model, Cmd AppMsg )
 init consumer =
     ( { consumer = consumer
       , selector = Topic.all consumer
@@ -62,5 +62,6 @@ update log msg model =
 
 
 subscriptions : ActorSystem AppMsg -> Model -> Sub (Maybe AppMsg)
-subscriptions _ model =
-    Topic.subscribe model.selector (\record -> Just (OrderReceived record))
+subscriptions system model =
+    Topic.subscribe system model.selector
+        |> Sub.map (Maybe.map OrderReceived)

@@ -21,6 +21,7 @@ send : Topic a -> a -> Task x ()
 sendKeyed : Topic a -> Key -> a -> Task x ()
 consumer : Topic a -> Group -> Task x (Consumer a)
 close : Consumer a -> Task x ()
+poll : Consumer a -> Task x (List (ConsumerRecord a))
 commit : Consumer a -> Task x ()
 seekToBeginning : Consumer a -> Task x ()
 seekToEnd : Consumer a -> Task x ()
@@ -30,5 +31,4 @@ selector : Selector msg msg
 selectMap : Consumer a -> (ConsumerRecord a -> msg) -> Selector msg b -> Selector msg b
 map : (a -> b) -> Selector msg a -> Selector msg b
 filter : (a -> Bool) -> Selector msg a -> Selector msg a
-poll : Selector msg a -> Task x (List a)
 subscribe : Selector msg a -> (a -> parentMsg) -> Sub parentMsg

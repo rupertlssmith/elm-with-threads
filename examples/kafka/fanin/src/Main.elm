@@ -6,14 +6,13 @@ Demonstrates multi-topic consumption with Selectors:
 
   - Two topics with different value types (Order, Payment)
   - selector: empty Selector as starting point
-  - selectMap: bridge each Consumer into a unified Event type
+  - selectMap: bridge each Consumer into a unified AppMsg type
   - filter: drop events that don't meet criteria
-  - map: wrap domain events in AppMsg
   - subscribe: reactive consumption from the combined Selector
 
 The EventProcessor actor consumes from both topics through one Selector.
 Publishers to each topic are decoupled — they only know their own value
-type, not the consumer's Event or AppMsg types.
+type, not the consumer's message types.
 
 -}
 
@@ -25,7 +24,7 @@ import Platform
 import Procedure
 import Procedure.Program
 import Time
-import Types exposing (AppMsg(..), Event(..), Order, Payment)
+import Types exposing (AppMsg(..), Order, Payment)
 
 
 
@@ -36,6 +35,56 @@ port logPort : String -> Cmd msg
 
 
 port exitPort : () -> Cmd msg
+
+
+
+-- CODECS
+
+
+encodeOrder : Order -> AppMsg
+encodeOrder order =
+    LogMsg ("O:" ++ String.fromInt order.id ++ ":" ++ order.product ++ ":" ++ String.fromFloat order.amount)
+
+
+decodeOrder : AppMsg -> Maybe Order
+decodeOrder msg =
+    case msg of
+        LogMsg s ->
+            case String.split ":" s of
+                "O" :: idStr :: product :: amountStr :: [] ->
+                    Maybe.map2
+                        (\id amount -> { id = id, product = product, amount = amount })
+                        (String.toInt idStr)
+                        (String.toFloat amountStr)
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+encodePayment : Payment -> AppMsg
+encodePayment payment =
+    LogMsg ("P:" ++ String.fromInt payment.orderId ++ ":" ++ String.fromFloat payment.amount ++ ":" ++ payment.method)
+
+
+decodePayment : AppMsg -> Maybe Payment
+decodePayment msg =
+    case msg of
+        LogMsg s ->
+            case String.split ":" s of
+                "P" :: orderIdStr :: amountStr :: method :: [] ->
+                    Maybe.map2
+                        (\orderId amount -> { orderId = orderId, amount = amount, method = method })
+                        (String.toInt orderIdStr)
+                        (String.toFloat amountStr)
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
 
 
 
@@ -90,15 +139,15 @@ log message =
 createTopics :
     Procedure.Procedure
         Never
-        { orders : Topic.Topic Order
-        , payments : Topic.Topic Payment
+        { orders : Topic.Topic AppMsg Order
+        , payments : Topic.Topic AppMsg Payment
         }
         Msg
 createTopics =
-    Topic.createTopic ctx { name = "orders", partitions = 3 }
+    Topic.createTopic ctx encodeOrder decodeOrder { name = "orders", partitions = 3 }
         |> Procedure.andThen
             (\ordersTopic ->
-                Topic.createTopic ctx { name = "payments", partitions = 2 }
+                Topic.createTopic ctx encodePayment decodePayment { name = "payments", partitions = 2 }
                     |> Procedure.map
                         (\paymentsTopic ->
                             { orders = ordersTopic
@@ -108,11 +157,10 @@ createTopics =
             )
 
 
-{-| Create consumers for both topics in the same group
-and spawn the EventProcessor with them.
+{-| Create consumers for both topics and spawn the EventProcessor with them.
 -}
 spawnEventProcessor :
-    { orders : Topic.Topic Order, payments : Topic.Topic Payment }
+    { orders : Topic.Topic AppMsg Order, payments : Topic.Topic AppMsg Payment }
     -> Procedure.Procedure Never EventProcessor.Flags Msg
 spawnEventProcessor topics =
     Topic.consumer ctx topics.orders "event-processors"
@@ -140,15 +188,13 @@ Note: Order #2 ($2.50) is below the $50 filter threshold in the
 EventProcessor's Selector, so it will be silently dropped.
 -}
 sendMessages :
-    { orders : Topic.Topic Order, payments : Topic.Topic Payment }
+    { orders : Topic.Topic AppMsg Order, payments : Topic.Topic AppMsg Payment }
     -> Procedure.Procedure Never () Msg
 sendMessages topics =
-    -- High-value orders (above $50 filter)
     Topic.send ctx topics.orders
         { id = 1, product = "Laptop", amount = 999.99 }
         |> Procedure.andThen
             (\() ->
-                -- Low-value order (below $50 filter — will be dropped by Selector)
                 Topic.send ctx topics.orders
                     { id = 2, product = "Sticker", amount = 2.50 }
             )

@@ -1,4 +1,4 @@
-module Types exposing (AppMsg(..), Event(..), Order, Payment)
+module Types exposing (AppMsg(..), Order, Payment)
 
 
 type alias Order =
@@ -15,14 +15,7 @@ type alias Payment =
     }
 
 
-{-| Intermediate domain type produced by selectMap from two different topics.
-The Selector unifies Order and Payment into a single Event stream.
--}
-type Event
+type AppMsg
     = OrderPlaced Order
     | PaymentReceived Payment
-
-
-type AppMsg
-    = EventOccurred Event
     | LogMsg String

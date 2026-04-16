@@ -1,7 +1,7 @@
 module Actor.Internal.TopicStore exposing
     ( TopicEntry
-    , ConsumerGroupState
     , ConsumerEntry
+    , PollResult
     , initTopic
     , publish
     , publishToPartition
@@ -11,21 +11,40 @@ module Actor.Internal.TopicStore exposing
     , seekToEnd
     , seekToOffset
     , initConsumer
+    , removeConsumer
     , partitionForKey
     )
 
 {-| In-memory partitioned log storage with consumer groups.
+
+Messages are stored with optional keys for partition routing.
+Poll returns metadata (partition, offset, key) alongside each message.
 -}
 
-import Actor.Internal.Types exposing (ConsumerId, Key, Offset, PartitionIndex, TopicId)
+import Actor.Internal.Types exposing (ConsumerId, Key, Offset, PartitionIndex, SubjectId, TopicId)
 import Array exposing (Array)
 import Dict exposing (Dict)
 
 
+type alias StoredMessage appMsg =
+    { message : appMsg
+    , key : Maybe Key
+    }
+
+
+type alias PollResult appMsg =
+    { message : appMsg
+    , key : Maybe Key
+    , partition : PartitionIndex
+    , offset : Offset
+    }
+
+
 type alias TopicEntry appMsg =
     { id : TopicId
+    , subjectId : SubjectId
     , numPartitions : Int
-    , partitions : Dict PartitionIndex (Array appMsg)
+    , partitions : Dict PartitionIndex (Array (StoredMessage appMsg))
     , nextConsumerId : ConsumerId
     , consumers : Dict ConsumerId ConsumerEntry
     }
@@ -39,14 +58,10 @@ type alias ConsumerEntry =
     }
 
 
-type alias ConsumerGroupState =
-    { offsets : Dict PartitionIndex Offset
-    }
-
-
-initTopic : TopicId -> Int -> TopicEntry appMsg
-initTopic tid numPartitions =
+initTopic : TopicId -> SubjectId -> Int -> TopicEntry appMsg
+initTopic tid sid numPartitions =
     { id = tid
+    , subjectId = sid
     , numPartitions = numPartitions
     , partitions =
         List.range 0 (numPartitions - 1)
@@ -57,35 +72,46 @@ initTopic tid numPartitions =
     }
 
 
-publish : appMsg -> TopicEntry appMsg -> TopicEntry appMsg
+publish : appMsg -> TopicEntry appMsg -> ( TopicEntry appMsg, { partition : PartitionIndex, offset : Offset } )
 publish msg entry =
     let
-        -- Round-robin: pick partition based on total message count
         totalMsgs =
             Dict.foldl (\_ arr acc -> acc + Array.length arr) 0 entry.partitions
 
         partition =
             modBy entry.numPartitions totalMsgs
     in
-    publishToPartition partition msg entry
+    publishToPartition partition Nothing msg entry
 
 
-publishToPartition : PartitionIndex -> appMsg -> TopicEntry appMsg -> TopicEntry appMsg
-publishToPartition partition msg entry =
+publishToPartition : PartitionIndex -> Maybe Key -> appMsg -> TopicEntry appMsg -> ( TopicEntry appMsg, { partition : PartitionIndex, offset : Offset } )
+publishToPartition partition key msg entry =
     let
+        currentArr =
+            Dict.get partition entry.partitions
+                |> Maybe.withDefault Array.empty
+
+        offset =
+            Array.length currentArr
+
+        stored =
+            { message = msg, key = key }
+
         updated =
             Dict.update partition
                 (\maybeArr ->
                     case maybeArr of
                         Just arr ->
-                            Just (Array.push msg arr)
+                            Just (Array.push stored arr)
 
                         Nothing ->
-                            Just (Array.fromList [ msg ])
+                            Just (Array.fromList [ stored ])
                 )
                 entry.partitions
     in
-    { entry | partitions = updated }
+    ( { entry | partitions = updated }
+    , { partition = partition, offset = offset }
+    )
 
 
 partitionForKey : Key -> Int -> PartitionIndex
@@ -108,7 +134,7 @@ initConsumer groupId entry =
                 |> List.map (\i -> ( i, 0 ))
                 |> Dict.fromList
 
-        consumer =
+        consumerEntry =
             { id = cid
             , groupId = groupId
             , currentOffsets = initialOffsets
@@ -117,13 +143,18 @@ initConsumer groupId entry =
     in
     ( { entry
         | nextConsumerId = cid + 1
-        , consumers = Dict.insert cid consumer entry.consumers
+        , consumers = Dict.insert cid consumerEntry entry.consumers
       }
     , cid
     )
 
 
-poll : ConsumerId -> TopicEntry appMsg -> ( TopicEntry appMsg, List appMsg )
+removeConsumer : ConsumerId -> TopicEntry appMsg -> TopicEntry appMsg
+removeConsumer consumerId entry =
+    { entry | consumers = Dict.remove consumerId entry.consumers }
+
+
+poll : ConsumerId -> TopicEntry appMsg -> ( TopicEntry appMsg, List (PollResult appMsg) )
 poll consumerId entry =
     case Dict.get consumerId entry.consumers of
         Nothing ->
@@ -131,22 +162,30 @@ poll consumerId entry =
 
         Just consumer ->
             let
-                ( newOffsets, messages ) =
+                ( newOffsets, results ) =
                     Dict.foldl
-                        (\partition arr ( offAcc, msgAcc ) ->
+                        (\partition arr ( offAcc, resAcc ) ->
                             let
                                 currentOffset =
                                     Dict.get partition consumer.currentOffsets
                                         |> Maybe.withDefault 0
 
-                                partitionMsgs =
+                                partitionResults =
                                     Array.toList (Array.slice currentOffset (Array.length arr) arr)
+                                        |> List.indexedMap
+                                            (\i stored ->
+                                                { message = stored.message
+                                                , key = stored.key
+                                                , partition = partition
+                                                , offset = currentOffset + i
+                                                }
+                                            )
 
                                 newOffset =
                                     Array.length arr
                             in
                             ( Dict.insert partition newOffset offAcc
-                            , msgAcc ++ partitionMsgs
+                            , resAcc ++ partitionResults
                             )
                         )
                         ( consumer.currentOffsets, [] )
@@ -156,7 +195,7 @@ poll consumerId entry =
                     { consumer | currentOffsets = newOffsets }
             in
             ( { entry | consumers = Dict.insert consumerId updatedConsumer entry.consumers }
-            , messages
+            , results
             )
 
 

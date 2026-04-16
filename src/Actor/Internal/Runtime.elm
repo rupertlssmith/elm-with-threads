@@ -5,6 +5,7 @@ module Actor.Internal.Runtime exposing
     , ProcessEntry(..)
     , ProcessEntryRecord
     , SystemContext
+    , TopicMessageMeta
     , collectActorSubs
     , collectSubscriptions
     , commitConsumer
@@ -23,6 +24,7 @@ module Actor.Internal.Runtime exposing
     , publishKeyedToTopic
     , publishToTopic
     , registerSelector
+    , removeConsumer
     , removeSelector
     , seekConsumerToBeginning
     , seekConsumerToEnd
@@ -30,6 +32,8 @@ module Actor.Internal.Runtime exposing
     , sendToSubject
     , spawnProcess
     , storeMessage
+    , storeTopicMeta
+    , lookupTopicMeta
     , messageStoreValues
     , updateTime
     )
@@ -101,6 +105,13 @@ type alias SubjectEntry =
     }
 
 
+type alias TopicMessageMeta =
+    { partition : PartitionIndex
+    , offset : Offset
+    , key : Maybe Key
+    }
+
+
 type alias ActorSystem appMsg =
     { nextProcessId : ProcessId
     , nextSubjectId : SubjectId
@@ -112,6 +123,7 @@ type alias ActorSystem appMsg =
     , selectors : Dict SelectorId (SelectorEntry appMsg)
     , topics : Dict TopicId (TopicEntry appMsg)
     , messageStore : Dict Int (MessageStoreEntry appMsg)
+    , topicMessageMeta : Dict Int TopicMessageMeta
     , currentTime : Time.Posix
     }
 
@@ -128,6 +140,7 @@ initSystem =
     , selectors = Dict.empty
     , topics = Dict.empty
     , messageStore = Dict.empty
+    , topicMessageMeta = Dict.empty
     , currentTime = Time.millisToPosix 0
     }
 
@@ -230,50 +243,60 @@ removeSelector sid system =
     { system | selectors = Dict.remove sid system.selectors }
 
 
-createTopic : String -> Int -> ActorSystem appMsg -> ( ActorSystem appMsg, TopicId )
+createTopic : String -> Int -> ActorSystem appMsg -> ( ActorSystem appMsg, ( TopicId, SubjectId ) )
 createTopic _ numPartitions system =
     let
         tid =
             system.nextTopicId
 
+        sid =
+            system.nextSubjectId
+
         entry =
-            TopicStore.initTopic tid numPartitions
+            TopicStore.initTopic tid sid numPartitions
     in
     ( { system
         | nextTopicId = tid + 1
+        , nextSubjectId = sid + 1
         , topics = Dict.insert tid entry system.topics
       }
-    , tid
+    , ( tid, sid )
     )
 
 
-publishToTopic : TopicId -> appMsg -> ActorSystem appMsg -> ActorSystem appMsg
+publishToTopic : TopicId -> appMsg -> ActorSystem appMsg -> ( ActorSystem appMsg, { subjectId : SubjectId, partition : PartitionIndex, offset : Offset } )
 publishToTopic tid msg system =
     case Dict.get tid system.topics of
         Nothing ->
-            system
+            ( system, { subjectId = 0, partition = 0, offset = 0 } )
 
         Just entry ->
-            { system | topics = Dict.insert tid (TopicStore.publish msg entry) system.topics }
+            let
+                ( updatedEntry, meta ) =
+                    TopicStore.publish msg entry
+            in
+            ( { system | topics = Dict.insert tid updatedEntry system.topics }
+            , { subjectId = entry.subjectId, partition = meta.partition, offset = meta.offset }
+            )
 
 
-publishKeyedToTopic : TopicId -> Key -> appMsg -> ActorSystem appMsg -> ActorSystem appMsg
+publishKeyedToTopic : TopicId -> Key -> appMsg -> ActorSystem appMsg -> ( ActorSystem appMsg, { subjectId : SubjectId, partition : PartitionIndex, offset : Offset } )
 publishKeyedToTopic tid key msg system =
     case Dict.get tid system.topics of
         Nothing ->
-            system
+            ( system, { subjectId = 0, partition = 0, offset = 0 } )
 
         Just entry ->
             let
                 partition =
                     TopicStore.partitionForKey key entry.numPartitions
+
+                ( updatedEntry, meta ) =
+                    TopicStore.publishToPartition partition (Just key) msg entry
             in
-            { system
-                | topics =
-                    Dict.insert tid
-                        (TopicStore.publishToPartition partition msg entry)
-                        system.topics
-            }
+            ( { system | topics = Dict.insert tid updatedEntry system.topics }
+            , { subjectId = entry.subjectId, partition = meta.partition, offset = meta.offset }
+            )
 
 
 createConsumer : TopicId -> String -> ActorSystem appMsg -> ( ActorSystem appMsg, ( TopicId, ConsumerId ) )
@@ -281,13 +304,19 @@ createConsumer tid groupId system =
     case Dict.get tid system.topics of
         Nothing ->
             let
+                sid =
+                    system.nextSubjectId
+
                 entry =
-                    TopicStore.initTopic tid 1
+                    TopicStore.initTopic tid sid 1
 
                 ( updatedEntry, cid ) =
                     TopicStore.initConsumer groupId entry
             in
-            ( { system | topics = Dict.insert tid updatedEntry system.topics }
+            ( { system
+                | nextSubjectId = sid + 1
+                , topics = Dict.insert tid updatedEntry system.topics
+              }
             , ( tid, cid )
             )
 
@@ -301,7 +330,7 @@ createConsumer tid groupId system =
             )
 
 
-pollConsumer : TopicId -> ConsumerId -> ActorSystem appMsg -> ( ActorSystem appMsg, List appMsg )
+pollConsumer : TopicId -> ConsumerId -> ActorSystem appMsg -> ( ActorSystem appMsg, List (TopicStore.PollResult appMsg) )
 pollConsumer tid cid system =
     case Dict.get tid system.topics of
         Nothing ->
@@ -309,11 +338,11 @@ pollConsumer tid cid system =
 
         Just entry ->
             let
-                ( updatedEntry, messages ) =
+                ( updatedEntry, results ) =
                     TopicStore.poll cid entry
             in
             ( { system | topics = Dict.insert tid updatedEntry system.topics }
-            , messages
+            , results
             )
 
 
@@ -558,6 +587,25 @@ collectSubscriptions routeMsg noOp system =
 updateTime : Time.Posix -> ActorSystem appMsg -> ActorSystem appMsg
 updateTime time system =
     { system | currentTime = time }
+
+
+removeConsumer : TopicId -> ConsumerId -> ActorSystem appMsg -> ActorSystem appMsg
+removeConsumer tid cid system =
+    updateTopicEntry tid (TopicStore.removeConsumer cid) system
+
+
+{-| Store topic message metadata (partition, offset, key) keyed by messageId.
+-}
+storeTopicMeta : Int -> TopicMessageMeta -> ActorSystem appMsg -> ActorSystem appMsg
+storeTopicMeta messageId meta system =
+    { system | topicMessageMeta = Dict.insert messageId meta system.topicMessageMeta }
+
+
+{-| Look up topic message metadata by messageId.
+-}
+lookupTopicMeta : Int -> ActorSystem appMsg -> Maybe TopicMessageMeta
+lookupTopicMeta messageId system =
+    Dict.get messageId system.topicMessageMeta
 
 
 {-| Store a message for port-bounce delivery and return its ID.
