@@ -12,6 +12,15 @@ function main() {
     });
   }
 
+  // Wire the P2P port-bounce: echo notifyP2PSend back through onP2PSend
+  if (app.ports && app.ports.notifyP2PSend && app.ports.onP2PSend) {
+    app.ports.notifyP2PSend.subscribe(
+      (data: { subjectId: number; messageId: number }) => {
+        app.ports.onP2PSend.send(data);
+      }
+    );
+  }
+
   if (app.ports && app.ports.exitPort) {
     app.ports.exitPort.subscribe(() => {
       console.log("Elm requested exit.");

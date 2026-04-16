@@ -185,20 +185,33 @@ partition/offset, and seek to end.
 -}
 demonstrateSeek : Topic.Consumer AppMsg Order -> Procedure.Procedure Never () Msg
 demonstrateSeek c =
+    let
+        logRecords label records =
+            let
+                formatRecord r =
+                    "  p=" ++ String.fromInt r.partition
+                        ++ " o=" ++ String.fromInt r.offset
+                        ++ " key=" ++ Maybe.withDefault "-" r.key
+                        ++ " -> #" ++ String.fromInt r.value.id
+                        ++ " " ++ r.value.product
+
+            in
+            log
+                (label
+                    ++ " "
+                    ++ String.fromInt (List.length records)
+                    ++ " records:\n"
+                    ++ String.join "\n" (List.map formatRecord records)
+                )
+    in
     Topic.seekToBeginning ctx c
         |> Procedure.andThen (\() -> log "Seeked to beginning")
         |> Procedure.andThen (\() -> Topic.poll ctx c)
-        |> Procedure.andThen
-            (\records ->
-                log ("Replayed " ++ String.fromInt (List.length records) ++ " records from beginning")
-            )
+        |> Procedure.andThen (\records -> logRecords "Replayed" records)
         |> Procedure.andThen (\() -> Topic.seek ctx c 0 1)
         |> Procedure.andThen (\() -> log "Seeked to partition=0, offset=1")
         |> Procedure.andThen (\() -> Topic.poll ctx c)
-        |> Procedure.andThen
-            (\records ->
-                log ("Polled " ++ String.fromInt (List.length records) ++ " records from offset 1")
-            )
+        |> Procedure.andThen (\records -> logRecords "From offset 1:" records)
         |> Procedure.andThen (\() -> Topic.seekToEnd ctx c)
         |> Procedure.andThen (\() -> log "Seeked to end")
 
