@@ -1,4 +1,4 @@
-# elm-actor-kafka
+# elm-with-threads
 
 An Elm actor system library with channel-based messaging and Kafka-style
 topics, built on top of
