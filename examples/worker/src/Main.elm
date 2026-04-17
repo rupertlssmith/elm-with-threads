@@ -1,7 +1,6 @@
 port module Main exposing (main)
 
-{-| Example worker demonstrating the actor system with Channel messaging,
-using elm-procedure for async composition.
+{-| Example worker demonstrating the actor system with Channel messaging.
 
 A supervisor actor spawns a worker actor, sends it jobs via a OneToOne channel,
 and the worker reports back. A Broadcast channel broadcasts system events.
@@ -9,11 +8,15 @@ and the worker reports back. A Broadcast channel broadcasts system events.
 Each actor creates its own Selector on its Channel and subscribes to it.
 The runtime collects actor subscriptions and routes matching messages back
 to the owning actor.
+
+Operations are composed with `Actor.Task`, which hides the `SystemContext`
+from every call site.
 -}
 
 import Actor.Channel as Channel
 import Actor.Core as Core
 import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext)
+import Actor.Task as Task
 import Platform
 import Procedure
 import Procedure.Program
@@ -31,6 +34,14 @@ port logPort : String -> Cmd msg
 
 
 port exitPort : () -> Cmd msg
+
+
+
+-- APP-LEVEL TASK ALIAS — collapses the two runtime type params
+
+
+type alias Task a =
+    Task.Task AppMsg Msg Never a
 
 
 
@@ -74,88 +85,85 @@ ctx =
 -- HELPERS
 
 
-log : String -> Procedure.Procedure Never () Msg
+log : String -> Task ()
 log message =
-    Procedure.do (logPort message)
-
-
-createOneToOne : Procedure.Procedure Never (Channel.Channel AppMsg Channel.OneToOne AppMsg) Msg
-createOneToOne =
-    Channel.oneToOne ctx identity Just
+    Task.fromProcedure (Procedure.do (logPort message))
 
 
 
--- INIT PROCEDURES
+-- INIT TASKS
 
 
-spawnSupervisor : Procedure.Procedure Never (Channel.Channel AppMsg Channel.OneToOne AppMsg) Msg
+spawnSupervisor : Task (Channel.Channel AppMsg Channel.OneToOne AppMsg)
 spawnSupervisor =
-    createOneToOne
-        |> Procedure.andThen
+    Channel.oneToOne identity Just
+        |> Task.andThen
             (\reportInbox ->
-                Core.spawn ctx (Supervisor.actor logPort) reportInbox
-                    |> Procedure.andThen (\_ -> log "Supervisor spawned")
-                    |> Procedure.map (\() -> reportInbox)
+                Core.spawn (Supervisor.actor logPort) reportInbox
+                    |> Task.andThen (\_ -> log "Supervisor spawned")
+                    |> Task.map (\() -> reportInbox)
             )
 
 
-spawnWorker : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Procedure.Procedure Never ( Channel.Channel AppMsg Channel.OneToOne AppMsg, Channel.Channel AppMsg Channel.OneToOne AppMsg ) Msg
+spawnWorker :
+    Channel.Channel AppMsg Channel.OneToOne AppMsg
+    -> Task ( Channel.Channel AppMsg Channel.OneToOne AppMsg, Channel.Channel AppMsg Channel.OneToOne AppMsg )
 spawnWorker reportInbox =
-    createOneToOne
-        |> Procedure.andThen
+    Channel.oneToOne identity Just
+        |> Task.andThen
             (\workerInbox ->
-                Core.spawn ctx (Worker.actor logPort) workerInbox
-                    |> Procedure.andThen (\_ -> log "Worker spawned")
-                    |> Procedure.map (\() -> ( reportInbox, workerInbox ))
+                Core.spawn (Worker.actor logPort) workerInbox
+                    |> Task.andThen (\_ -> log "Worker spawned")
+                    |> Task.map (\() -> ( reportInbox, workerInbox ))
             )
 
 
-setupBroadcast : Procedure.Procedure Never (Channel.Channel AppMsg Channel.Broadcast AppMsg) Msg
+setupBroadcast : Task (Channel.Channel AppMsg Channel.Broadcast AppMsg)
 setupBroadcast =
-    Channel.broadcast ctx identity Just
-        |> Procedure.andThen
+    Channel.broadcast identity Just
+        |> Task.andThen
             (\topic ->
                 log "Events broadcast channel created"
-                    |> Procedure.andThen (\() -> Procedure.do (Runtime.msgToCmd (SetEventsTopic topic)))
-                    |> Procedure.map (\() -> topic)
+                    |> Task.andThen (\() -> Task.fromProcedure (Procedure.do (Runtime.msgToCmd (SetEventsTopic topic))))
+                    |> Task.map (\() -> topic)
             )
 
 
-publishEvents : Channel.Channel AppMsg Channel.Broadcast AppMsg -> Procedure.Procedure Never () Msg
+publishEvents : Channel.Channel AppMsg Channel.Broadcast AppMsg -> Task ()
 publishEvents topic =
-    Channel.publish ctx topic (TopicEvent "system-started")
-        |> Procedure.andThen (\() -> Channel.publish ctx topic (TopicEvent "supervisor-ready"))
-        |> Procedure.andThen (\() -> Channel.publish ctx topic (TopicEvent "worker-spawned"))
-        |> Procedure.andThen (\() -> log "Published 3 events to broadcast channel")
+    Channel.publish topic (TopicEvent "system-started")
+        |> Task.andThen (\() -> Channel.publish topic (TopicEvent "supervisor-ready"))
+        |> Task.andThen (\() -> Channel.publish topic (TopicEvent "worker-spawned"))
+        |> Task.andThen (\() -> log "Published 3 events to broadcast channel")
 
 
-sendJobs : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Procedure.Procedure Never () Msg
+sendJobs : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Task ()
 sendJobs workerInbox =
-    Channel.send ctx workerInbox (WorkerJob 1)
-        |> Procedure.andThen (\() -> Channel.send ctx workerInbox (WorkerJob 2))
-        |> Procedure.andThen (\() -> Channel.send ctx workerInbox (WorkerJob 3))
-        |> Procedure.andThen (\() -> log "Sent 3 jobs to worker")
+    Channel.send workerInbox (WorkerJob 1)
+        |> Task.andThen (\() -> Channel.send workerInbox (WorkerJob 2))
+        |> Task.andThen (\() -> Channel.send workerInbox (WorkerJob 3))
+        |> Task.andThen (\() -> log "Sent 3 jobs to worker")
 
 
-sendReport : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Procedure.Procedure Never () Msg
+sendReport : Channel.Channel AppMsg Channel.OneToOne AppMsg -> Task ()
 sendReport reportInbox =
-    Channel.send ctx reportInbox (WorkerReport "Jobs queued")
+    Channel.send reportInbox (WorkerReport "Jobs queued")
 
 
-initProcedure : Procedure.Procedure Never () Msg
-initProcedure =
+initTask : Task ()
+initTask =
     log "=== elm-actor-kafka started ==="
-        |> Procedure.andThen (\() -> spawnSupervisor)
-        |> Procedure.andThen spawnWorker
-        |> Procedure.andThen
+        |> Task.andThen (\() -> spawnSupervisor)
+        |> Task.andThen spawnWorker
+        |> Task.andThen
             (\( reportInbox, workerInbox ) ->
                 setupBroadcast
-                    |> Procedure.andThen publishEvents
-                    |> Procedure.andThen (\() -> sendJobs workerInbox)
-                    |> Procedure.andThen (\() -> sendReport reportInbox)
+                    |> Task.andThen publishEvents
+                    |> Task.andThen (\() -> sendJobs workerInbox)
+                    |> Task.andThen (\() -> sendReport reportInbox)
             )
-        |> Procedure.andThen (\() -> log "--- Messages sent, delivery via port-bounce Sub ---")
-        |> Procedure.andThen (\() -> log "=== Init complete ===")
+        |> Task.andThen (\() -> log "--- Messages sent, delivery via port-bounce Sub ---")
+        |> Task.andThen (\() -> log "=== Init complete ===")
 
 
 
@@ -177,7 +185,7 @@ init _ =
       , procModel = Procedure.Program.init
       , eventsTopic = Nothing
       }
-    , Procedure.run ProcMsg (\() -> InitDone) initProcedure
+    , Task.run ctx ProcMsg (\() -> InitDone) initTask
     )
 
 

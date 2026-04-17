@@ -14,10 +14,14 @@ The EventProcessor actor consumes from both topics through one Selector.
 Publishers to each topic are decoupled — they only know their own value
 type, not the consumer's message types.
 
+Operations are composed with `Actor.Task`, which hides the `SystemContext`
+from every call site.
+
 -}
 
 import Actor.Core as Core
 import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext)
+import Actor.Task as Task
 import Actor.Topic as Topic
 import EventProcessor
 import Platform
@@ -35,6 +39,14 @@ port logPort : String -> Cmd msg
 
 
 port exitPort : () -> Cmd msg
+
+
+
+-- APP-LEVEL TASK ALIAS
+
+
+type alias Task a =
+    Task.Task AppMsg Msg Never a
 
 
 
@@ -125,30 +137,23 @@ ctx =
 -- HELPERS
 
 
-log : String -> Procedure.Procedure Never () Msg
+log : String -> Task ()
 log message =
-    Procedure.do (logPort message)
+    Task.fromProcedure (Procedure.do (logPort message))
 
 
 
--- INIT PROCEDURES
+-- INIT TASKS
 
 
-{-| Create both topics.
--}
 createTopics :
-    Procedure.Procedure
-        Never
-        { orders : Topic.Topic AppMsg Order
-        , payments : Topic.Topic AppMsg Payment
-        }
-        Msg
+    Task { orders : Topic.Topic AppMsg Order, payments : Topic.Topic AppMsg Payment }
 createTopics =
-    Topic.createTopic ctx encodeOrder decodeOrder { name = "orders", partitions = 3 }
-        |> Procedure.andThen
+    Topic.createTopic encodeOrder decodeOrder { name = "orders", partitions = 3 }
+        |> Task.andThen
             (\ordersTopic ->
-                Topic.createTopic ctx encodePayment decodePayment { name = "payments", partitions = 2 }
-                    |> Procedure.map
+                Topic.createTopic encodePayment decodePayment { name = "payments", partitions = 2 }
+                    |> Task.map
                         (\paymentsTopic ->
                             { orders = ordersTopic
                             , payments = paymentsTopic
@@ -157,17 +162,15 @@ createTopics =
             )
 
 
-{-| Create consumers for both topics and spawn the EventProcessor with them.
--}
 spawnEventProcessor :
     { orders : Topic.Topic AppMsg Order, payments : Topic.Topic AppMsg Payment }
-    -> Procedure.Procedure Never EventProcessor.Flags Msg
+    -> Task EventProcessor.Flags
 spawnEventProcessor topics =
-    Topic.consumer ctx topics.orders "event-processors"
-        |> Procedure.andThen
+    Topic.consumer topics.orders "event-processors"
+        |> Task.andThen
             (\ordersConsumer ->
-                Topic.consumer ctx topics.payments "event-processors"
-                    |> Procedure.andThen
+                Topic.consumer topics.payments "event-processors"
+                    |> Task.andThen
                         (\paymentsConsumer ->
                             let
                                 flags =
@@ -175,61 +178,56 @@ spawnEventProcessor topics =
                                     , payments = paymentsConsumer
                                     }
                             in
-                            Core.spawn ctx (EventProcessor.actor logPort) flags
-                                |> Procedure.andThen (\_ -> log "EventProcessor spawned with orders + payments consumers")
-                                |> Procedure.map (\() -> flags)
+                            Core.spawn (EventProcessor.actor logPort) flags
+                                |> Task.andThen (\_ -> log "EventProcessor spawned with orders + payments consumers")
+                                |> Task.map (\() -> flags)
                         )
             )
 
 
-{-| Send a mix of orders and payments.
-
-Note: Order #2 ($2.50) is below the $50 filter threshold in the
-EventProcessor's Selector, so it will be silently dropped.
--}
 sendMessages :
     { orders : Topic.Topic AppMsg Order, payments : Topic.Topic AppMsg Payment }
-    -> Procedure.Procedure Never () Msg
+    -> Task ()
 sendMessages topics =
-    Topic.send ctx topics.orders
+    Topic.send topics.orders
         { id = 1, product = "Laptop", amount = 999.99 }
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
-                Topic.send ctx topics.orders
+                Topic.send topics.orders
                     { id = 2, product = "Sticker", amount = 2.50 }
             )
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
-                Topic.send ctx topics.orders
+                Topic.send topics.orders
                     { id = 3, product = "Monitor", amount = 349.00 }
             )
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
-                Topic.send ctx topics.payments
+                Topic.send topics.payments
                     { orderId = 1, amount = 999.99, method = "credit_card" }
             )
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
-                Topic.send ctx topics.payments
+                Topic.send topics.payments
                     { orderId = 3, amount = 349.00, method = "paypal" }
             )
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
                 log "Sent 3 orders + 2 payments (order #2 at $2.50 will be filtered out)"
             )
 
 
-initProcedure : Procedure.Procedure Never () Msg
-initProcedure =
+initTask : Task ()
+initTask =
     log "=== Kafka Fan-In Example ==="
-        |> Procedure.andThen (\() -> createTopics)
-        |> Procedure.andThen
+        |> Task.andThen (\() -> createTopics)
+        |> Task.andThen
             (\topics ->
                 spawnEventProcessor topics
-                    |> Procedure.andThen (\_ -> sendMessages topics)
+                    |> Task.andThen (\_ -> sendMessages topics)
             )
-        |> Procedure.andThen (\() -> log "--- Events arriving via unified Selector subscription ---")
-        |> Procedure.andThen (\() -> log "=== Init complete ===")
+        |> Task.andThen (\() -> log "--- Events arriving via unified Selector subscription ---")
+        |> Task.andThen (\() -> log "=== Init complete ===")
 
 
 
@@ -250,7 +248,7 @@ init _ =
     ( { system = Runtime.initSystem
       , procModel = Procedure.Program.init
       }
-    , Procedure.run ProcMsg (\() -> InitDone) initProcedure
+    , Task.run ctx ProcMsg (\() -> InitDone) initTask
     )
 
 

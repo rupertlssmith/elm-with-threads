@@ -22,7 +22,9 @@ module Actor.Advanced.P2P exposing
 
 {-| Enriched P2P messaging with metadata envelopes.
 
-Send operations use elm-procedure for async composition.
+Each operation returns an `Actor.Task.Task` that internally threads the
+`SystemContext` so call sites don't have to.
+
 Subscribe returns a real Elm Sub via port-bounce.
 
 Selectors have two type parameters: `msg` is the input message type,
@@ -38,9 +40,10 @@ and the system message type `msg`.
 
 -}
 
-import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext, msgToCmd)
+import Actor.Internal.Runtime as Runtime exposing (ActorSystem, msgToCmd)
 import Actor.Internal.Types exposing (SubjectId)
 import Actor.Ports
+import Actor.Task as Task exposing (Task)
 import Procedure
 
 
@@ -82,52 +85,58 @@ type alias Envelope a =
 
 {-| Create a new advanced subject with an encoder/decoder codec.
 -}
-subject : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Subject msg a) parentMsg
-subject ctx encode decode =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+subject : (a -> msg) -> (msg -> Maybe a) -> Task msg parentMsg err (Subject msg a)
+subject encode decode =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, sid ) =
-                            Runtime.createSubject system
+                        op system =
+                            let
+                                ( newSystem, sid ) =
+                                    Runtime.createSubject system
+                            in
+                            ( newSystem, msgToCmd (tagger (Subject sid encode decode)) )
                     in
-                    ( newSystem, msgToCmd (tagger (Subject sid encode decode)) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Send a message to an advanced subject. Encodes the payload, stores it,
 and fires a port notification for subscribers.
 -}
-send : SystemContext msg parentMsg -> Subject msg a -> a -> Procedure.Procedure Never () parentMsg
-send ctx (Subject sid encode _) value =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+send : Subject msg a -> a -> Task msg parentMsg err ()
+send (Subject sid encode _) value =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, messageId ) =
-                            Runtime.storeMessage sid (encode value) system
+                        op system =
+                            let
+                                ( newSystem, messageId ) =
+                                    Runtime.storeMessage sid (encode value) system
+                            in
+                            ( newSystem
+                            , Cmd.batch
+                                [ Actor.Ports.notifyP2PSend
+                                    { subjectId = sid, messageId = messageId }
+                                , msgToCmd (tagger ())
+                                ]
+                            )
                     in
-                    ( newSystem
-                    , Cmd.batch
-                        [ Actor.Ports.notifyP2PSend
-                            { subjectId = sid, messageId = messageId }
-                        , msgToCmd (tagger ())
-                        ]
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Resend a message marked as a possible duplicate.
 -}
-resendAsPossibleDuplicate : SystemContext msg parentMsg -> Subject msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
-resendAsPossibleDuplicate ctx subj _ a =
-    send ctx subj a
+resendAsPossibleDuplicate : Subject msg a -> Key -> a -> Task msg parentMsg err ()
+resendAsPossibleDuplicate subj _ a =
+    send subj a
 
 
 {-| Create a selector that accepts messages from a specific subject.
@@ -223,23 +232,26 @@ withTimeout _ _ sel =
 
 {-| One-shot select from message store.
 -}
-select : SystemContext msg parentMsg -> Selector msg a -> Procedure.Procedure Never (Maybe a) parentMsg
-select ctx (Selector sel) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+select : Selector msg a -> Task msg parentMsg err (Maybe a)
+select (Selector sel) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        matched =
-                            system
-                                |> Runtime.messageStoreValues
-                                |> List.filterMap
-                                    (\entry -> sel entry.message entry.subjectId)
-                                |> List.head
+                        op system =
+                            let
+                                matched =
+                                    system
+                                        |> Runtime.messageStoreValues
+                                        |> List.filterMap
+                                            (\entry -> sel entry.message entry.subjectId)
+                                        |> List.head
+                            in
+                            ( system, msgToCmd (tagger matched) )
                     in
-                    ( system, msgToCmd (tagger matched) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -247,29 +259,32 @@ select ctx (Selector sel) =
 The selector operates on `( Meta, msg )` tuples.
 In this simulation, default metadata is provided.
 -}
-selectWithMeta : SystemContext msg parentMsg -> Selector ( Meta, msg ) a -> Procedure.Procedure Never (Maybe a) parentMsg
-selectWithMeta ctx (Selector sel) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+selectWithMeta : Selector ( Meta, msg ) a -> Task msg parentMsg err (Maybe a)
+selectWithMeta (Selector sel) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        defaultMeta =
-                            { key = Nothing
-                            , possibleDuplicate = False
-                            , sequence = Nothing
-                            }
+                        op system =
+                            let
+                                defaultMeta =
+                                    { key = Nothing
+                                    , possibleDuplicate = False
+                                    , sequence = Nothing
+                                    }
 
-                        matched =
-                            system
-                                |> Runtime.messageStoreValues
-                                |> List.filterMap
-                                    (\entry -> sel ( defaultMeta, entry.message ) entry.subjectId)
-                                |> List.head
+                                matched =
+                                    system
+                                        |> Runtime.messageStoreValues
+                                        |> List.filterMap
+                                            (\entry -> sel ( defaultMeta, entry.message ) entry.subjectId)
+                                        |> List.head
+                            in
+                            ( system, msgToCmd (tagger matched) )
                     in
-                    ( system, msgToCmd (tagger matched) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 

@@ -25,8 +25,10 @@ module Actor.Topic exposing
     , subscribe
     )
 
-{-| Kafka-style partitioned log topics with consumer groups and selectors,
-using elm-procedure for async composition.
+{-| Kafka-style partitioned log topics with consumer groups and selectors.
+
+Each operation returns an `Actor.Task.Task` that internally threads the
+`SystemContext` so call sites don't have to.
 
 Topics and consumers carry a codec for encoding/decoding between
 the payload type `a` and the system message type `msg`.
@@ -47,10 +49,10 @@ receive messages reactively.
 
 -}
 
-import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext, TopicMessageMeta, msgToCmd)
-import Actor.Internal.TopicStore as TopicStore
+import Actor.Internal.Runtime as Runtime exposing (ActorSystem, TopicMessageMeta, msgToCmd)
 import Actor.Internal.Types exposing (ConsumerId, SubjectId, TopicId)
 import Actor.Ports
+import Actor.Task as Task exposing (Task)
 import Procedure
 
 
@@ -114,19 +116,22 @@ type alias Offset =
 {-| Create a new topic with a name and partition count,
 plus an encoder/decoder codec.
 -}
-createTopic : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> { name : String, partitions : Int } -> Procedure.Procedure Never (Topic msg a) parentMsg
-createTopic ctx encode decode config =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+createTopic : (a -> msg) -> (msg -> Maybe a) -> { name : String, partitions : Int } -> Task msg parentMsg err (Topic msg a)
+createTopic encode decode config =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, ( tid, sid ) ) =
-                            Runtime.createTopic config.name config.partitions system
+                        op system =
+                            let
+                                ( newSystem, ( tid, sid ) ) =
+                                    Runtime.createTopic config.name config.partitions system
+                            in
+                            ( newSystem, msgToCmd (tagger (Topic tid sid encode decode)) )
                     in
-                    ( newSystem, msgToCmd (tagger (Topic tid sid encode decode)) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -138,35 +143,38 @@ createTopic ctx encode decode config =
 Encodes the payload, stores in the topic log and message store,
 and fires a port notification for subscribers.
 -}
-send : SystemContext msg parentMsg -> Topic msg a -> a -> Procedure.Procedure Never () parentMsg
-send ctx (Topic tid sid encode _) value =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+send : Topic msg a -> a -> Task msg parentMsg err ()
+send (Topic tid sid encode _) value =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        encoded =
-                            encode value
+                        op system =
+                            let
+                                encoded =
+                                    encode value
 
-                        ( s1, pubMeta ) =
-                            Runtime.publishToTopic tid encoded system
+                                ( s1, pubMeta ) =
+                                    Runtime.publishToTopic tid encoded system
 
-                        ( s2, messageId ) =
-                            Runtime.storeMessage sid encoded s1
+                                ( s2, messageId ) =
+                                    Runtime.storeMessage sid encoded s1
 
-                        s3 =
-                            Runtime.storeTopicMeta messageId
-                                { partition = pubMeta.partition, offset = pubMeta.offset, key = Nothing }
-                                s2
+                                s3 =
+                                    Runtime.storeTopicMeta messageId
+                                        { partition = pubMeta.partition, offset = pubMeta.offset, key = Nothing }
+                                        s2
+                            in
+                            ( s3
+                            , Cmd.batch
+                                [ Actor.Ports.notifyP2PSend { subjectId = sid, messageId = messageId }
+                                , msgToCmd (tagger ())
+                                ]
+                            )
                     in
-                    ( s3
-                    , Cmd.batch
-                        [ Actor.Ports.notifyP2PSend { subjectId = sid, messageId = messageId }
-                        , msgToCmd (tagger ())
-                        ]
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -174,35 +182,38 @@ send ctx (Topic tid sid encode _) value =
 Messages with the same key always land on the same partition,
 preserving ordering for that key.
 -}
-sendKeyed : SystemContext msg parentMsg -> Topic msg a -> Key -> a -> Procedure.Procedure Never () parentMsg
-sendKeyed ctx (Topic tid sid encode _) key value =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+sendKeyed : Topic msg a -> Key -> a -> Task msg parentMsg err ()
+sendKeyed (Topic tid sid encode _) key value =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        encoded =
-                            encode value
+                        op system =
+                            let
+                                encoded =
+                                    encode value
 
-                        ( s1, pubMeta ) =
-                            Runtime.publishKeyedToTopic tid key encoded system
+                                ( s1, pubMeta ) =
+                                    Runtime.publishKeyedToTopic tid key encoded system
 
-                        ( s2, messageId ) =
-                            Runtime.storeMessage sid encoded s1
+                                ( s2, messageId ) =
+                                    Runtime.storeMessage sid encoded s1
 
-                        s3 =
-                            Runtime.storeTopicMeta messageId
-                                { partition = pubMeta.partition, offset = pubMeta.offset, key = Just key }
-                                s2
+                                s3 =
+                                    Runtime.storeTopicMeta messageId
+                                        { partition = pubMeta.partition, offset = pubMeta.offset, key = Just key }
+                                        s2
+                            in
+                            ( s3
+                            , Cmd.batch
+                                [ Actor.Ports.notifyP2PSend { subjectId = sid, messageId = messageId }
+                                , msgToCmd (tagger ())
+                                ]
+                            )
                     in
-                    ( s3
-                    , Cmd.batch
-                        [ Actor.Ports.notifyP2PSend { subjectId = sid, messageId = messageId }
-                        , msgToCmd (tagger ())
-                        ]
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -213,99 +224,117 @@ sendKeyed ctx (Topic tid sid encode _) key value =
 {-| Create a consumer for a topic within a consumer group.
 The consumer inherits the codec from the topic.
 -}
-consumer : SystemContext msg parentMsg -> Topic msg a -> Group -> Procedure.Procedure Never (Consumer msg a) parentMsg
-consumer ctx (Topic tid sid encode decode) groupId =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+consumer : Topic msg a -> Group -> Task msg parentMsg err (Consumer msg a)
+consumer (Topic tid sid encode decode) groupId =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, ( topicId, consumerId ) ) =
-                            Runtime.createConsumer tid groupId system
+                        op system =
+                            let
+                                ( newSystem, ( topicId, consumerId ) ) =
+                                    Runtime.createConsumer tid groupId system
+                            in
+                            ( newSystem, msgToCmd (tagger (Consumer topicId consumerId sid encode decode)) )
                     in
-                    ( newSystem, msgToCmd (tagger (Consumer topicId consumerId sid encode decode)) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Close a consumer, removing it from the consumer group.
 -}
-close : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never () parentMsg
-close ctx (Consumer tid cid _ _ _) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
-                    ( Runtime.removeConsumer tid cid system
-                    , msgToCmd (tagger ())
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+close : Consumer msg a -> Task msg parentMsg err ()
+close (Consumer tid cid _ _ _) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
+                    let
+                        op system =
+                            ( Runtime.removeConsumer tid cid system
+                            , msgToCmd (tagger ())
+                            )
+                    in
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Commit the consumer's current offset (marks messages as processed).
 -}
-commit : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never () parentMsg
-commit ctx (Consumer tid cid _ _ _) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
-                    ( Runtime.commitConsumer tid cid system
-                    , msgToCmd (tagger ())
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+commit : Consumer msg a -> Task msg parentMsg err ()
+commit (Consumer tid cid _ _ _) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
+                    let
+                        op system =
+                            ( Runtime.commitConsumer tid cid system
+                            , msgToCmd (tagger ())
+                            )
+                    in
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Seek the consumer to the beginning of all partitions.
 -}
-seekToBeginning : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never () parentMsg
-seekToBeginning ctx (Consumer tid cid _ _ _) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
-                    ( Runtime.seekConsumerToBeginning tid cid system
-                    , msgToCmd (tagger ())
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+seekToBeginning : Consumer msg a -> Task msg parentMsg err ()
+seekToBeginning (Consumer tid cid _ _ _) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
+                    let
+                        op system =
+                            ( Runtime.seekConsumerToBeginning tid cid system
+                            , msgToCmd (tagger ())
+                            )
+                    in
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Seek the consumer to the end of all partitions.
 -}
-seekToEnd : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never () parentMsg
-seekToEnd ctx (Consumer tid cid _ _ _) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
-                    ( Runtime.seekConsumerToEnd tid cid system
-                    , msgToCmd (tagger ())
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+seekToEnd : Consumer msg a -> Task msg parentMsg err ()
+seekToEnd (Consumer tid cid _ _ _) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
+                    let
+                        op system =
+                            ( Runtime.seekConsumerToEnd tid cid system
+                            , msgToCmd (tagger ())
+                            )
+                    in
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Seek the consumer to a specific offset on a specific partition.
 -}
-seek : SystemContext msg parentMsg -> Consumer msg a -> Partition -> Offset -> Procedure.Procedure Never () parentMsg
-seek ctx (Consumer tid cid _ _ _) partition offset =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
-                    ( Runtime.seekConsumerToOffset tid cid partition offset system
-                    , msgToCmd (tagger ())
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+seek : Consumer msg a -> Partition -> Offset -> Task msg parentMsg err ()
+seek (Consumer tid cid _ _ _) partition offset =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
+                    let
+                        op system =
+                            ( Runtime.seekConsumerToOffset tid cid partition offset system
+                            , msgToCmd (tagger ())
+                            )
+                    in
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -316,34 +345,37 @@ seek ctx (Consumer tid cid _ _ _) partition offset =
 {-| Poll for new messages from a consumer. Advances the consumer's current offset.
 Returns ConsumerRecords with value, key, partition, and offset metadata.
 -}
-poll : SystemContext msg parentMsg -> Consumer msg a -> Procedure.Procedure Never (List (ConsumerRecord a)) parentMsg
-poll ctx (Consumer tid cid _ _ decode) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+poll : Consumer msg a -> Task msg parentMsg err (List (ConsumerRecord a))
+poll (Consumer tid cid _ _ decode) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, results ) =
-                            Runtime.pollConsumer tid cid system
+                        op system =
+                            let
+                                ( newSystem, results ) =
+                                    Runtime.pollConsumer tid cid system
 
-                        records =
-                            List.filterMap
-                                (\r ->
-                                    decode r.message
-                                        |> Maybe.map
-                                            (\value ->
-                                                { value = value
-                                                , key = r.key
-                                                , partition = r.partition
-                                                , offset = r.offset
-                                                }
-                                            )
-                                )
-                                results
+                                records =
+                                    List.filterMap
+                                        (\r ->
+                                            decode r.message
+                                                |> Maybe.map
+                                                    (\value ->
+                                                        { value = value
+                                                        , key = r.key
+                                                        , partition = r.partition
+                                                        , offset = r.offset
+                                                        }
+                                                    )
+                                        )
+                                        results
+                            in
+                            ( newSystem, msgToCmd (tagger records) )
                     in
-                    ( newSystem, msgToCmd (tagger records) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 

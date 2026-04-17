@@ -6,7 +6,8 @@ module Actor.Core exposing
     , kill
     )
 
-{-| Actor lifecycle management using elm-procedure for async composition.
+{-| Actor lifecycle management. Each operation returns an `Actor.Task.Task`
+that internally threads the `SystemContext` so call sites don't have to.
 
 @docs Actor, Process
 @docs spawn, self, kill
@@ -14,8 +15,9 @@ module Actor.Core exposing
 -}
 
 import Actor.Internal.Mailbox as Mailbox
-import Actor.Internal.Runtime as Runtime exposing (ActorSystem, ProcessEntry(..), SystemContext, msgToCmd)
+import Actor.Internal.Runtime as Runtime exposing (ActorSystem, ProcessEntry(..), msgToCmd)
 import Actor.Internal.Types as InternalTypes exposing (Process(..), ProcessId)
+import Actor.Task as Task exposing (Task)
 import Procedure
 
 
@@ -40,67 +42,75 @@ type alias Process msg =
 
 
 {-| Spawn a new actor process with the given flags.
-Returns a Procedure that yields the process handle.
 -}
-spawn : SystemContext msg parentMsg -> Actor flags model msg -> flags -> Procedure.Procedure Never (Process msg) parentMsg
-spawn ctx actor flags =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+spawn : Actor flags model msg -> flags -> Task msg parentMsg err (Process msg)
+spawn actor flags =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( initialModel, initCmd ) =
-                            actor.init flags
+                        op system =
+                            let
+                                ( initialModel, initCmd ) =
+                                    actor.init flags
 
-                        makeEntry pid =
-                            ProcessEntry
-                                { id = pid
-                                , mailbox = Mailbox.empty
-                                , handleMessage = handleWith actor initialModel pid
-                                , actorSubs = \sys -> actor.subscriptions sys initialModel
-                                }
+                                makeEntry pid =
+                                    ProcessEntry
+                                        { id = pid
+                                        , mailbox = Mailbox.empty
+                                        , handleMessage = handleWith actor initialModel pid
+                                        , actorSubs = \sys -> actor.subscriptions sys initialModel
+                                        }
 
-                        ( newSystem, spawnedPid ) =
-                            Runtime.spawnProcess makeEntry system
+                                ( newSystem, spawnedPid ) =
+                                    Runtime.spawnProcess makeEntry system
+                            in
+                            ( newSystem
+                            , Cmd.batch
+                                [ msgToCmd (tagger (Process spawnedPid))
+                                , ctx.mapAppCmd initCmd
+                                ]
+                            )
                     in
-                    ( newSystem
-                    , Cmd.batch
-                        [ msgToCmd (tagger (Process spawnedPid))
-                        , ctx.mapAppCmd initCmd
-                        ]
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Get the current process. Used by the top-level process to look itself up.
 -}
-self : SystemContext msg parentMsg -> Procedure.Procedure Never (Process msg) parentMsg
-self ctx =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
-                    ( system, msgToCmd (tagger (Process 0)) )
-            in
-            msgToCmd (ctx.runOp op)
+self : Task msg parentMsg err (Process msg)
+self =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
+                    let
+                        op system =
+                            ( system, msgToCmd (tagger (Process 0)) )
+                    in
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Kill a running process and clean up its resources.
 -}
-kill : SystemContext msg parentMsg -> Process msg -> Procedure.Procedure Never () parentMsg
-kill ctx (Process pid) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
-                    ( Runtime.killProcess pid system
-                    , msgToCmd (tagger ())
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+kill : Process msg -> Task msg parentMsg err ()
+kill (Process pid) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
+                    let
+                        op system =
+                            ( Runtime.killProcess pid system
+                            , msgToCmd (tagger ())
+                            )
+                    in
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 

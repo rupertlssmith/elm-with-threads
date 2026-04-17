@@ -26,7 +26,9 @@ The phantom type parameter `c` distinguishes delivery semantics:
   - `OneToOne` — point-to-point messaging (one consumer)
   - `Broadcast` — pub/sub messaging (all consumers)
 
-Send operations use elm-procedure for async composition.
+Send/publish operations return an `Actor.Task.Task` that internally threads
+the `SystemContext` so call sites don't have to.
+
 Subscribe returns a real Elm Sub via port-bounce: each send fires a port
 notification, JS echoes it back, and the subscribe Sub picks it up.
 
@@ -43,9 +45,10 @@ and the system message type `msg`.
 
 -}
 
-import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext, msgToCmd)
+import Actor.Internal.Runtime as Runtime exposing (ActorSystem, msgToCmd)
 import Actor.Internal.Types exposing (SubjectId)
 import Actor.Ports
+import Actor.Task as Task exposing (Task)
 import Procedure
 
 
@@ -80,37 +83,43 @@ type Selector msg a
 
 {-| Create a new point-to-point channel with an encoder/decoder codec.
 -}
-oneToOne : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Channel msg OneToOne a) parentMsg
-oneToOne ctx encode decode =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+oneToOne : (a -> msg) -> (msg -> Maybe a) -> Task msg parentMsg err (Channel msg OneToOne a)
+oneToOne encode decode =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, sid ) =
-                            Runtime.createSubject system
+                        op system =
+                            let
+                                ( newSystem, sid ) =
+                                    Runtime.createSubject system
+                            in
+                            ( newSystem, msgToCmd (tagger (Channel sid encode decode)) )
                     in
-                    ( newSystem, msgToCmd (tagger (Channel sid encode decode)) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
 {-| Create a new broadcast channel with an encoder/decoder codec.
 -}
-broadcast : SystemContext msg parentMsg -> (a -> msg) -> (msg -> Maybe a) -> Procedure.Procedure Never (Channel msg Broadcast a) parentMsg
-broadcast ctx encode decode =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+broadcast : (a -> msg) -> (msg -> Maybe a) -> Task msg parentMsg err (Channel msg Broadcast a)
+broadcast encode decode =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, sid ) =
-                            Runtime.createSubject system
+                        op system =
+                            let
+                                ( newSystem, sid ) =
+                                    Runtime.createSubject system
+                            in
+                            ( newSystem, msgToCmd (tagger (Channel sid encode decode)) )
                     in
-                    ( newSystem, msgToCmd (tagger (Channel sid encode decode)) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -118,25 +127,28 @@ broadcast ctx encode decode =
 in the message store, and fires a port notification. Subscribers are woken via
 the port-bounce echo.
 -}
-send : SystemContext msg parentMsg -> Channel msg OneToOne a -> a -> Procedure.Procedure Never () parentMsg
-send ctx (Channel sid encode _) value =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+send : Channel msg OneToOne a -> a -> Task msg parentMsg err ()
+send (Channel sid encode _) value =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, messageId ) =
-                            Runtime.storeMessage sid (encode value) system
+                        op system =
+                            let
+                                ( newSystem, messageId ) =
+                                    Runtime.storeMessage sid (encode value) system
+                            in
+                            ( newSystem
+                            , Cmd.batch
+                                [ Actor.Ports.notifyP2PSend
+                                    { subjectId = sid, messageId = messageId }
+                                , msgToCmd (tagger ())
+                                ]
+                            )
                     in
-                    ( newSystem
-                    , Cmd.batch
-                        [ Actor.Ports.notifyP2PSend
-                            { subjectId = sid, messageId = messageId }
-                        , msgToCmd (tagger ())
-                        ]
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -144,25 +156,28 @@ send ctx (Channel sid encode _) value =
 in the message store, and fires a port notification. All subscribers receive
 the message via port-bounce.
 -}
-publish : SystemContext msg parentMsg -> Channel msg Broadcast a -> a -> Procedure.Procedure Never () parentMsg
-publish ctx (Channel sid encode _) value =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+publish : Channel msg Broadcast a -> a -> Task msg parentMsg err ()
+publish (Channel sid encode _) value =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        ( newSystem, messageId ) =
-                            Runtime.storeMessage sid (encode value) system
+                        op system =
+                            let
+                                ( newSystem, messageId ) =
+                                    Runtime.storeMessage sid (encode value) system
+                            in
+                            ( newSystem
+                            , Cmd.batch
+                                [ Actor.Ports.notifyP2PSend
+                                    { subjectId = sid, messageId = messageId }
+                                , msgToCmd (tagger ())
+                                ]
+                            )
                     in
-                    ( newSystem
-                    , Cmd.batch
-                        [ Actor.Ports.notifyP2PSend
-                            { subjectId = sid, messageId = messageId }
-                        , msgToCmd (tagger ())
-                        ]
-                    )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 
@@ -259,23 +274,26 @@ withTimeout _ _ sel =
 
 {-| One-shot select: scan the message store for the first matching message.
 -}
-select : SystemContext msg parentMsg -> Selector msg a -> Procedure.Procedure Never (Maybe a) parentMsg
-select ctx (Selector sel) =
-    Procedure.fetch
-        (\tagger ->
-            let
-                op system =
+select : Selector msg a -> Task msg parentMsg err (Maybe a)
+select (Selector sel) =
+    Task.fromContext
+        (\ctx ->
+            Procedure.fetch
+                (\tagger ->
                     let
-                        matched =
-                            system
-                                |> Runtime.messageStoreValues
-                                |> List.filterMap
-                                    (\entry -> sel entry.message entry.subjectId)
-                                |> List.head
+                        op system =
+                            let
+                                matched =
+                                    system
+                                        |> Runtime.messageStoreValues
+                                        |> List.filterMap
+                                            (\entry -> sel entry.message entry.subjectId)
+                                        |> List.head
+                            in
+                            ( system, msgToCmd (tagger matched) )
                     in
-                    ( system, msgToCmd (tagger matched) )
-            in
-            msgToCmd (ctx.runOp op)
+                    msgToCmd (ctx.runOp op)
+                )
         )
 
 

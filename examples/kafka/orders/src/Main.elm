@@ -13,10 +13,14 @@ Demonstrates the basic producer-consumer cycle:
   - close to leave the consumer group
   - subscribe via Selector for reactive delivery to an actor
 
+Operations are composed with `Actor.Task`, which hides the `SystemContext`
+from every call site.
+
 -}
 
 import Actor.Core as Core
 import Actor.Internal.Runtime as Runtime exposing (ActorSystem, SystemContext)
+import Actor.Task as Task
 import Actor.Topic as Topic
 import OrderProcessor
 import Platform
@@ -34,6 +38,14 @@ port logPort : String -> Cmd msg
 
 
 port exitPort : () -> Cmd msg
+
+
+
+-- APP-LEVEL TASK ALIAS
+
+
+type alias Task a =
+    Task.Task AppMsg Msg Never a
 
 
 
@@ -99,67 +111,57 @@ ctx =
 -- HELPERS
 
 
-log : String -> Procedure.Procedure Never () Msg
+log : String -> Task ()
 log message =
-    Procedure.do (logPort message)
+    Task.fromProcedure (Procedure.do (logPort message))
 
 
 
--- INIT PROCEDURES
+-- INIT TASKS
 
 
-{-| Create the orders topic with 3 partitions.
--}
-createOrdersTopic : Procedure.Procedure Never (Topic.Topic AppMsg Order) Msg
+createOrdersTopic : Task (Topic.Topic AppMsg Order)
 createOrdersTopic =
-    Topic.createTopic ctx encodeOrder decodeOrder { name = "orders", partitions = 3 }
+    Topic.createTopic encodeOrder decodeOrder { name = "orders", partitions = 3 }
 
 
-{-| Create a consumer in the "order-processors" group
-and spawn the OrderProcessor actor with it.
--}
-spawnProcessor : Topic.Topic AppMsg Order -> Procedure.Procedure Never (Topic.Consumer AppMsg Order) Msg
+spawnProcessor : Topic.Topic AppMsg Order -> Task (Topic.Consumer AppMsg Order)
 spawnProcessor ordersTopic =
-    Topic.consumer ctx ordersTopic "order-processors"
-        |> Procedure.andThen
+    Topic.consumer ordersTopic "order-processors"
+        |> Task.andThen
             (\c ->
-                Core.spawn ctx (OrderProcessor.actor logPort) c
-                    |> Procedure.andThen (\_ -> log "OrderProcessor actor spawned")
-                    |> Procedure.map (\() -> c)
+                Core.spawn (OrderProcessor.actor logPort) c
+                    |> Task.andThen (\_ -> log "OrderProcessor actor spawned")
+                    |> Task.map (\() -> c)
             )
 
 
-{-| Send orders: some unkeyed (round-robin partition assignment),
-some keyed by customer ID (deterministic partition routing).
--}
-sendOrders : Topic.Topic AppMsg Order -> Procedure.Procedure Never () Msg
+sendOrders : Topic.Topic AppMsg Order -> Task ()
 sendOrders ordersTopic =
-    Topic.send ctx ordersTopic
+    Topic.send ordersTopic
         { id = 1, product = "Widget", customerId = "C100" }
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
-                Topic.send ctx ordersTopic
+                Topic.send ordersTopic
                     { id = 2, product = "Gadget", customerId = "C200" }
             )
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
-                Topic.sendKeyed ctx ordersTopic "C100"
+                Topic.sendKeyed ordersTopic "C100"
                     { id = 3, product = "Doohickey", customerId = "C100" }
             )
-        |> Procedure.andThen
+        |> Task.andThen
             (\() ->
-                Topic.sendKeyed ctx ordersTopic "C200"
+                Topic.sendKeyed ordersTopic "C200"
                     { id = 4, product = "Thingamajig", customerId = "C200" }
             )
-        |> Procedure.andThen (\() -> log "Sent 4 orders (2 unkeyed, 2 keyed by customer)")
+        |> Task.andThen (\() -> log "Sent 4 orders (2 unkeyed, 2 keyed by customer)")
 
 
-{-| Poll consumer, log each record's metadata, then commit.
--}
-pollAndCommit : Topic.Consumer AppMsg Order -> Procedure.Procedure Never () Msg
+pollAndCommit : Topic.Consumer AppMsg Order -> Task ()
 pollAndCommit c =
-    Topic.poll ctx c
-        |> Procedure.andThen
+    Topic.poll c
+        |> Task.andThen
             (\records ->
                 let
                     formatRecord r =
@@ -176,14 +178,11 @@ pollAndCommit c =
                         ++ String.join "\n" (List.map formatRecord records)
                     )
             )
-        |> Procedure.andThen (\() -> Topic.commit ctx c)
-        |> Procedure.andThen (\() -> log "Offsets committed")
+        |> Task.andThen (\() -> Topic.commit c)
+        |> Task.andThen (\() -> log "Offsets committed")
 
 
-{-| Demonstrate seek operations: replay from beginning, seek to a specific
-partition/offset, and seek to end.
--}
-demonstrateSeek : Topic.Consumer AppMsg Order -> Procedure.Procedure Never () Msg
+demonstrateSeek : Topic.Consumer AppMsg Order -> Task ()
 demonstrateSeek c =
     let
         logRecords label records =
@@ -194,7 +193,6 @@ demonstrateSeek c =
                         ++ " key=" ++ Maybe.withDefault "-" r.key
                         ++ " -> #" ++ String.fromInt r.value.id
                         ++ " " ++ r.value.product
-
             in
             log
                 (label
@@ -204,35 +202,35 @@ demonstrateSeek c =
                     ++ String.join "\n" (List.map formatRecord records)
                 )
     in
-    Topic.seekToBeginning ctx c
-        |> Procedure.andThen (\() -> log "Seeked to beginning")
-        |> Procedure.andThen (\() -> Topic.poll ctx c)
-        |> Procedure.andThen (\records -> logRecords "Replayed" records)
-        |> Procedure.andThen (\() -> Topic.seek ctx c 0 1)
-        |> Procedure.andThen (\() -> log "Seeked to partition=0, offset=1")
-        |> Procedure.andThen (\() -> Topic.poll ctx c)
-        |> Procedure.andThen (\records -> logRecords "From offset 1:" records)
-        |> Procedure.andThen (\() -> Topic.seekToEnd ctx c)
-        |> Procedure.andThen (\() -> log "Seeked to end")
+    Topic.seekToBeginning c
+        |> Task.andThen (\() -> log "Seeked to beginning")
+        |> Task.andThen (\() -> Topic.poll c)
+        |> Task.andThen (\records -> logRecords "Replayed" records)
+        |> Task.andThen (\() -> Topic.seek c 0 1)
+        |> Task.andThen (\() -> log "Seeked to partition=0, offset=1")
+        |> Task.andThen (\() -> Topic.poll c)
+        |> Task.andThen (\records -> logRecords "From offset 1:" records)
+        |> Task.andThen (\() -> Topic.seekToEnd c)
+        |> Task.andThen (\() -> log "Seeked to end")
 
 
-initProcedure : Procedure.Procedure Never () Msg
-initProcedure =
+initTask : Task ()
+initTask =
     log "=== Kafka Orders Example ==="
-        |> Procedure.andThen (\() -> createOrdersTopic)
-        |> Procedure.andThen
+        |> Task.andThen (\() -> createOrdersTopic)
+        |> Task.andThen
             (\ordersTopic ->
                 spawnProcessor ordersTopic
-                    |> Procedure.andThen
+                    |> Task.andThen
                         (\c ->
                             sendOrders ordersTopic
-                                |> Procedure.andThen (\() -> pollAndCommit c)
-                                |> Procedure.andThen (\() -> demonstrateSeek c)
-                                |> Procedure.andThen (\() -> Topic.close ctx c)
-                                |> Procedure.andThen (\() -> log "Consumer closed, left group")
+                                |> Task.andThen (\() -> pollAndCommit c)
+                                |> Task.andThen (\() -> demonstrateSeek c)
+                                |> Task.andThen (\() -> Topic.close c)
+                                |> Task.andThen (\() -> log "Consumer closed, left group")
                         )
             )
-        |> Procedure.andThen (\() -> log "=== Done ===")
+        |> Task.andThen (\() -> log "=== Done ===")
 
 
 
@@ -253,7 +251,7 @@ init _ =
     ( { system = Runtime.initSystem
       , procModel = Procedure.Program.init
       }
-    , Procedure.run ProcMsg (\() -> InitDone) initProcedure
+    , Task.run ctx ProcMsg (\() -> InitDone) initTask
     )
 
 
